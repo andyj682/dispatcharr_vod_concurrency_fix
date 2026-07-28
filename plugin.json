@@ -1,0 +1,17 @@
+{
+  "name": "Dispatcharr VOD Concurrency Fix",
+  "version": "0.2.0",
+  "description": "Dispatcharr plugin that coalesces the near-simultaneous range requests from some clients (notably Emby) when playing MKV VOD files so they share one provider slot instead of failing over to a different file and corrupting playback.",
+  "author": "andyj682",
+  "help_url": "https://github.com/andyj682/dispatcharr_vod_concurrency_fix",
+  "fields": [],
+  "actions": [
+    {
+      "id": "status",
+      "label": "Show patch status",
+      "description": "Report whether the concurrency patch is active in the worker that handles this request.",
+      "button_label": "Check status",
+      "button_variant": "outline"
+    }
+  ]
+}
