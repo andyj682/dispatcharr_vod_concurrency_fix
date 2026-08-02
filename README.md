@@ -12,37 +12,29 @@ its own upstream range read. The plugin hooks both profile *selection* (so the
 burst isn't rejected "at capacity") and *reservation* (so the slot is counted
 once). See `DESIGN.md` for the full rationale and `patch.py` for the code.
 
-- The selection/reservation logic is checked by `test_logic.py` (run
-  `python test_logic.py` — no Dispatcharr or Redis required).
 - No configuration needed. No user data collected.
+
+*Targets current Dispatcharr's multi-worker VOD proxy. If the internals it
+patches change — or a request hits an unexpected error — it falls back to native
+behavior (no coalescing) rather than breaking playback.*
 
 ---
 
 ## Install
 
-**Files:** this folder must contain `plugin.json` and `plugin.py` (and
-`patch.py`). Folder name on the host: `dispatcharr_vod_concurrency_fix`.
-
 ### Option A — Import via the UI (recommended)
-1. Zip the plugin folder so the archive contains the folder with `plugin.json`
-   and `plugin.py` inside it (`dispatcharr_vod_concurrency_fix.zip`).
-   > **Windows note:** do NOT build the zip with PowerShell `Compress-Archive` —
-   > it writes Windows `\` path separators that Dispatcharr's Linux importer
-   > can't read ("missing plugin.py"). Build it with Python instead so entries
-   > use `/`:
-   > ```bash
-   > py -3 -c "import zipfile,os; d='dispatcharr_vod_concurrency_fix'; z=zipfile.ZipFile(d+'.zip','w',zipfile.ZIP_DEFLATED); [z.write(os.path.join(d,f), d+'/'+f) for f in os.listdir(d) if os.path.isfile(os.path.join(d,f))]; z.close()"
-   > ```
+1. Download `dispatcharr_vod_concurrency_fix.zip` from the
+   [latest release](https://github.com/andyj682/dispatcharr_vod_concurrency_fix/releases/latest).
 2. Dispatcharr UI → **Plugins** → **Import** → upload the zip.
 3. Toggle the plugin **enabled** (accept the trust warning — plugins run
    server-side code).
-4. **Restart the Dispatcharr container.** This is what guarantees the patch is
-   applied in *all* uWSGI workers, including the ones that serve VOD (see
-   "Why restart?" below).
+4. **Restart the Dispatcharr container** (see "Why restart?" below).
 
-### Option B — Drop-in folder
-1. Copy this folder to `data/plugins/dispatcharr_vod_concurrency_fix/` on the
-   host (→ `/app/data/plugins/…` in the container).
+### Option B — Drop-in folder (from source)
+1. Clone or copy this repo into `data/plugins/dispatcharr_vod_concurrency_fix/`
+   on the host (→ `/app/data/plugins/…` in the container). The folder must be
+   named `dispatcharr_vod_concurrency_fix` and contain `plugin.json` +
+   `plugin.py`.
 2. UI → **Plugins** → click **reload** (or `POST /api/plugins/plugins/reload/`).
 3. Enable the plugin, then **restart the container**.
 
@@ -54,7 +46,18 @@ request; a restart patches all of them.
 
 ---
 
-## Verify the patch is live in every worker (do this before trusting it)
+## Uninstall / disable
+
+- UI → **Plugins** → toggle **off** (Dispatcharr calls the plugin's `stop()`,
+  which reverts the monkeypatch in that worker and deactivates it in the rest).
+- For a clean, guaranteed revert across all workers, **restart the container**
+  after disabling.
+
+---
+
+## Troubleshooting
+
+### Verify the patch is live
 
 The plugin logs one line per worker per entry point the first time it runs:
 
@@ -73,9 +76,7 @@ Steps:
    you only ever see one PID, the patch is not in every worker — restart again
    and re-check.
 
----
-
-## Test the actual fix
+### Test the actual fix
 
 1. Set the VOD profile's `max_streams: 1` (the condition that used to fail).
 2. Play the title that triggers Emby's burst.
@@ -105,18 +106,7 @@ Grep helper (adjust to your log access):
 docker logs <dispatcharr-container> 2>&1 | grep -E "VOD-CC|VOD-FAILOVER|PROFILE-SELECTION|PROFILE-RESERVE|PROFILE-DECR"
 ```
 
----
-
-## Uninstall / disable
-
-- UI → **Plugins** → toggle **off** (Dispatcharr calls the plugin's `stop()`,
-  which reverts the monkeypatch in that worker and deactivates it in the rest).
-- For a clean, guaranteed revert across all workers, **restart the container**
-  after disabling.
-
----
-
-## Local logic test (optional)
+### Local logic test
 
 ```bash
 python test_logic.py
@@ -128,7 +118,7 @@ Redis required.
 
 ---
 
-## Risks / what to watch for (beyond the happy path)
+## Limitations / potential fail points
 
 The patch touches VOD streaming through the **Xtream-Codes path**
 (`stream_xc_movie/episode -> stream_vod`), every profile, movies and episodes.
@@ -184,11 +174,6 @@ touched.
    (our decrement falls back to a raw native decrement outside a request
    context). No worse than stock, and scoped to one (ip, content).
 
-7. **Changed-internals / per-request safety.** If Dispatcharr refactors the
-   patched functions, `install()` refuses to patch and logs why; any per-request
-   error falls back to native. Failure mode is "no coalescing," never "broken
-   streaming."
-
 **Context safety:** the `(ip, content)` context lives in a greenlet-local that
 is set at the top of `stream_vod` and always reset at request end (the streaming
 generator's `finally`, or the non-streaming/`except` paths). Combined with
@@ -208,7 +193,7 @@ etc.) are untouched except through the unmodified native reserve/release calls.
 
 ---
 
-## Prior art / acknowledgments
+## Acknowledgments
 
 The idea of coalescing a VOD client's near-simultaneous range-request burst by
 `(client IP, content)` with a short grace period comes from
