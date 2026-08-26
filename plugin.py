@@ -38,7 +38,7 @@ class Plugin:
     name = "VOD Concurrency Fix"
     version = "1.0.0"
     description = (
-        "Dispatcharr plugin that coalesces the near-simultaneous range requests "
+        "Coalesces the near-simultaneous range requests "
         "from some clients (notably Emby) when playing MKV VOD files so they "
         "share one provider slot instead of failing over to a different file "
         "and corrupting playback."
