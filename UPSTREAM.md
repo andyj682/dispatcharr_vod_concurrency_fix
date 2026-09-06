@@ -111,7 +111,7 @@ Confirmed on a real deployment across all 4 workers.
 
 Concurrent burst, `max_streams: 1` — coalesced onto one slot, no failover:
 ```
-[PROFILE-SELECTION] Selected profile 3 (TREX raw Default): 0/1 connections
+[PROFILE-SELECTION] Selected profile 3 (Provider A Default): 0/1 connections
 [PROFILE-RESERVE] Profile 3 slot reserved: 1/1
 [VOD-CC] group OWNER reserved profile 3 (account 3) for <ip>/<uuidA>
 [VOD-CC] selection: reusing group profile 3 … (bypassing capacity, 1/1)
@@ -126,7 +126,7 @@ fails over to another account while movie A holds the slot), and the burst then
 stays pinned to the account it landed on:
 ```
 [PROFILE-SELECTION] All profiles at capacity for M3U account 3, rejecting request
-[PROFILE-SELECTION] Selected profile 8 (Strong 4K VOD Default): 0/1 connections
+[PROFILE-SELECTION] Selected profile 8 (Provider B Default): 0/1 connections
 [VOD-CC] group OWNER reserved profile 8 (account 8) for <ip>/<uuidB>
 [VOD-CC] selection: pinning <ip>/<uuidB> to group account 8, skipping account 3
 [VOD-CC] selection: reusing group profile 8 … (bypassing capacity, 1/1)
