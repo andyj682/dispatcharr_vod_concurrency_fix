@@ -42,6 +42,7 @@ class Env:
         self.native_releases = 0
         self.profiles = {}         # pid -> FakeProfile
         self.native_capacity = {}  # pid -> max (for native selection stub)
+        self.expire_calls = {}     # group_key -> count of EXPIRE refreshes
 
 
 ENV = Env()  # rebound per scenario
@@ -114,6 +115,13 @@ class FakeRedis:
     def hgetall(self, key):
         h = ENV.store.get(key)
         return dict(h) if h else {}
+
+    def expire(self, key, ttl):
+        # Model Redis EXPIRE: only affects an existing key; record refreshes.
+        if key in ENV.store:
+            ENV.expire_calls[key] = ENV.expire_calls.get(key, 0) + 1
+            return 1
+        return 0
 
 
 _FAKE_REDIS = FakeRedis()
@@ -395,12 +403,55 @@ def test_generator_close_ordering():
     check("context reset after stream ends", getattr(patch._local, "plan", None) is None)
 
 
+def test_group_ttl_refresh_during_streaming():
+    # Regression for the seek-failover bug: a steady playback connection must
+    # keep its coalescing group alive (refresh TTL) so a later seek finds the
+    # group and rides it instead of failing over.
+    print("test_group_ttl_refresh_during_streaming")
+    setup([FakeProfile(5, 1, 5)])
+    gkey = "vodcc:grp:10.0.0.5:uuidS"
+    ENV.store[gkey] = {"refcount": 1, "reserved": "1", "profile_id": "5",
+                       "account_id": "5"}  # group exists (owner streaming)
+
+    saved_interval = patch.GROUP_REFRESH_INTERVAL_SECONDS
+    patch.GROUP_REFRESH_INTERVAL_SECONDS = 0  # force a refresh on each chunk
+
+    def native_gen():
+        for _ in range(3):
+            yield b"x"
+
+    class Resp:
+        def __init__(self, g):
+            self.streaming_content = g
+
+    def fake_orig(*a, **k):
+        # simulate patched_reserve having set the group plan during the call
+        patch._local.plan = "GROUP"
+        patch._local.group_key = gkey
+        return Resp(native_gen())
+
+    saved = patch._orig_stream_vod
+    patch._orig_stream_vod = fake_orig
+    try:
+        resp = patch.patched_stream_vod({"ip": "10.0.0.5"}, "movie", "uuidS")
+        list(resp.streaming_content)  # consume the stream
+    finally:
+        patch._orig_stream_vod = saved
+        patch.GROUP_REFRESH_INTERVAL_SECONDS = saved_interval
+
+    check("group TTL refreshed while streaming (>=1 EXPIRE on the group key)",
+          ENV.expire_calls.get(gkey, 0) >= 1)
+    check("no group refresh once context/plan is torn down",
+          getattr(patch._local, "plan", None) is None)
+
+
 if __name__ == "__main__":
     test_emby_burst()
     test_rider_pins_to_group_account()
     test_different_client_does_not_ride()
     test_partial_failure_keeps_slot()
     test_generator_close_ordering()
+    test_group_ttl_refresh_during_streaming()
     print()
     if _failures:
         print(f"{len(_failures)} check(s) FAILED: {_failures}")

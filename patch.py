@@ -102,8 +102,15 @@ logger = logging.getLogger("plugins.dispatcharr_vod_concurrency_fix")
 
 # How long a coalescing group survives without activity. Bounds leaks from
 # abrupt client crashes that skip the release path, and the documented
-# same-session edge case. Refreshed on every reserve/release touch.
-GROUP_TTL_SECONDS = 30
+# same-session edge case. Refreshed on every reserve/release touch AND
+# periodically while a stream is active (see GROUP_REFRESH_INTERVAL_SECONDS) so
+# the group doesn't evaporate mid-playback and cause a seek to fail over.
+GROUP_TTL_SECONDS = 60
+
+# While a connection is streaming, refresh the group's TTL at most this often
+# (one cheap EXPIRE) so the group stays alive for the whole playback. Must be
+# comfortably below GROUP_TTL_SECONDS.
+GROUP_REFRESH_INTERVAL_SECONDS = 15
 
 # Redis key prefix. Deliberately distinct from the older cedric-marcoux plugin's
 # `vod_client_slot:` keys so the two never collide if both are ever present.
@@ -543,12 +550,32 @@ def patched_stream_vod(*args, **kwargs):
 
     snap = _snapshot_ctx()
     native_gen = streaming_content
+    # Keep this stream's coalescing group alive while it streams. Group keys have
+    # a short TTL that is otherwise only refreshed on reserve/release events; a
+    # single steady playback connection generates none, so after GROUP_TTL the
+    # group would expire mid-watch and a later SEEK (a new request for the same
+    # ip+content, arriving while this connection still holds the provider slot)
+    # would find no group, be treated as a fresh reservation, hit the capacity
+    # wall, and fail over to another provider. Refreshing here prevents that.
+    refresh_gkey = snap.get("group_key") if snap.get("plan") == "GROUP" else None
 
     def _wrapped_gen():
         _restore_ctx(snap)
+        refresh_redis = _get_redis() if refresh_gkey else None
+        last_refresh = time.time()
         try:
             for chunk in native_gen:
                 yield chunk
+                if refresh_redis is not None:
+                    now = time.time()
+                    if now - last_refresh >= GROUP_REFRESH_INTERVAL_SECONDS:
+                        last_refresh = now
+                        try:
+                            # EXPIRE is a no-op on a missing key, so this only
+                            # extends a live group -- it never resurrects a dead one.
+                            refresh_redis.expire(refresh_gkey, GROUP_TTL_SECONDS)
+                        except Exception:
+                            pass
         finally:
             # On client disconnect the server closes THIS generator; native's
             # profile-release runs inside native_gen's GeneratorExit handler,

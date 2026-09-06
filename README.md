@@ -1,8 +1,11 @@
 # Dispatcharr VOD Concurrency Fix (plugin)
 
-Plugin for Dispatcharr that stops an MKV "open-file burst" (2–3 near-simultaneous HTTP range
-requests) from exhausting a `max_streams: 1` VOD profile and failing over to a
-different provider account / different underlying file. This has been observed and tested with Emby, but likely applies to other MKV direct-play players.
+Plugin for Dispatcharr that stops overlapping VOD requests from one client —
+the MKV "open-file burst" (2–3 near-simultaneous HTTP range requests) at start,
+**and a seek** (a new connection that opens before the old one closes) — from
+exhausting a `max_streams: 1` VOD profile and failing over to a different
+provider account / different underlying file. This has been observed and tested
+with Emby, but likely applies to other MKV direct-play players.
 
 The plugin coalesces requests by `(client IP, content)`: the first
 request reserves one provider connection slot and the others within a few
@@ -100,6 +103,12 @@ Steps:
    that proves the failover was prevented.
 4. Afterwards, confirm the provider connection count returns to 0 (no leaked
    slot) — the `group LAST member -> releasing` line should fire once per burst.
+5. **Seek test:** play a title, let it run **more than a minute**, then seek. It
+   should stay on the same provider. In the log the seek shows
+   `selection: reusing group profile … (bypassing capacity)` / `group RIDER` —
+   **not** `All profiles at capacity` followed by a fresh `group OWNER` on a
+   different account. (Before v1.1.0, a seek after ~30s of steady play failed
+   over because the coalescing group had expired mid-playback.)
 
 Grep helper (adjust to your log access):
 ```bash
@@ -168,7 +177,7 @@ touched.
 
 6. **Leaked slot on abrupt crash — bounded and self-healing.** If a stream dies
    skipping its teardown (worker crash, hard TCP reset), a group can hold its
-   slot up to the group TTL (`GROUP_TTL_SECONDS`, 30s); within that window a new
+   slot up to the group TTL (`GROUP_TTL_SECONDS`, 60s); within that window a new
    same-(ip,content) request could bypass capacity onto the phantom group.
    Dispatcharr's own stale-connection cleanup still recovers the native counter
    (our decrement falls back to a raw native decrement outside a request
@@ -184,7 +193,10 @@ cannot bleed into a later one.
 
 - `vodcc:grp:{client_ip}:{content_uuid}` — hash: `refcount`, `reserved`,
   `profile_id`, `account_id`, `created_at`, `last_activity`; TTL
-  `GROUP_TTL_SECONDS` (30s), refreshed on activity. Deliberately distinct from
+  `GROUP_TTL_SECONDS` (60s), refreshed on reserve/release events **and
+  periodically while a connection is streaming** (so a mid-playback **seek** —
+  a new connection opening before the old one closes — finds the group and rides
+  it instead of failing over). Deliberately distinct from
   the older `cedric-marcoux/dispatcharr_vod_fix` plugin's `vod_client_slot:`
   keys.
 

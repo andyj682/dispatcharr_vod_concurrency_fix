@@ -42,7 +42,8 @@ coordinated monkeypatches (this is the same shape as the proven older
 ```
 group key:  vodcc:grp:{client_ip}:{content_uuid}
 fields:     refcount, reserved, profile_id, account_id, created_at, last_activity
-TTL:        GROUP_TTL_SECONDS (30s), refreshed on activity
+TTL:        GROUP_TTL_SECONDS (60s), refreshed on reserve/release AND
+            periodically while streaming (see "Seek coverage" below)
 ```
 
 1. **`stream_vod`** — set per-request `(client_ip, content_uuid)` context in a
@@ -78,6 +79,27 @@ sharing one profile-slot reservation and one file.
 - **Owner finishing first:** the no-Range probe (#1) often ends before playback
   (#2/#3). Release is tied to *last-out*, not to the owner, so the slot is not
   freed early. Verified.
+
+## Seek coverage (v1.1.0)
+
+The same over-count bites on a **seek**: the player opens a new range request
+before the old connection closes, so for a moment there are two connections for
+one (ip, content). Coalescing already handles that *if the group is alive* — the
+new request rides. The gap (fixed in v1.1.0): the group key's TTL was only
+refreshed on reserve/release events, and a single steady playback connection
+generates none, so after `GROUP_TTL_SECONDS` the group would expire *mid-watch*
+while the stream still held the provider slot. A seek after that point found no
+group → became a fresh reservation → hit the capacity wall → failed over.
+(Confirmed live: a seek 61s into steady playback logged `All profiles at
+capacity` + a fresh `group OWNER` on the failover account, no `group RIDER`.)
+
+Fix: the streaming generator refreshes the group's TTL periodically
+(`GROUP_REFRESH_INTERVAL_SECONDS`, one cheap `EXPIRE`, throttled) so the group
+stays alive as long as any connection is streaming; `EXPIRE` no-ops on a missing
+key so it can only extend a live group, never resurrect a dead one. Base TTL
+raised to 60s for pause cushion. Residual edge: a *pause* longer than the TTL
+with the connection held open (no bytes flowing → no refresh) could still let the
+group lapse; rare, and no worse than pre-v1.1.0.
 
 ## Why context threading is safe (the part the old plugin got wrong)
 

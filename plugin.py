@@ -36,7 +36,7 @@ except Exception:  # never break app startup because of the plugin
 
 class Plugin:
     name = "VOD Concurrency Fix"
-    version = "1.0.0"
+    version = "1.1.0"
     description = (
         "Coalesces the near-simultaneous range requests "
         "from some clients (notably Emby) when playing MKV VOD files so they "

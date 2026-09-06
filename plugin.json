@@ -1,6 +1,6 @@
 {
   "name": "VOD Concurrency Fix",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Coalesces the near-simultaneous range requests from some clients (notably Emby) when playing MKV VOD files so they share one provider slot instead of failing over to a different file and corrupting playback.",
   "author": "andyj682",
   "help_url": "https://github.com/andyj682/dispatcharr_vod_concurrency_fix",
