@@ -255,11 +255,42 @@ v0.31.0's connection manager grew a `_resolve_effective_profile(existing_state,
 fallback_profile, ...)` that prefers the profile already bound on the **session
 hash** over the view's pick, "so reserve and teardown always target the same
 counter". For a *new* session the stored id is `None` and it returns the view's
-pick — i.e. ours — so the group pin still wins, which is why no change was
-needed here. It only overrides for a session that already has a profile bound
-(reconnect / idle-session reuse), where holding the existing counter is the
-correct behaviour anyway. Worth knowing because it is now the one place upstream
-can override our selection.
+pick — i.e. ours — so the group pin still wins. It only overrides for a session
+that already has a different profile bound (reconnect, idle-session adoption,
+create race), and it is now the one place upstream can override our selection.
+
+When it *does* override, it calls our patched `reserve`/`decrement` with a
+profile the group never pinned, in three distinct shapes:
+
+- **create race** (`manager:1313-1314`) — the only site where our pick was
+  already reserved earlier in the same request (`manager:1233`), so upstream
+  decrements our profile and reserves its own back to back. Our decrement
+  consumes the greenlet-local group plan and the following reserve has to
+  re-establish it.
+- **reconnect / idle reuse** (`manager:1341`, `:1361`) — no prior reserve in the
+  request; upstream reserves its effective profile directly while the group is
+  pinned to another.
+
+All three are covered by `test_upstream_effective_profile_override`, which
+asserts the property that actually matters: **the native counter returns to 0 and
+native reserve/release stay symmetric**, whatever upstream re-points. They do —
+the group's refcounting absorbs the override, because a rider never touches the
+native counter in either direction, so the group still takes exactly one native
+reservation and releases exactly one. (This was initially suspected to cause
+counter drift; the test disproves that, and is mutation-checked — a
+double-counting rider fails it.)
+
+One semantic consequence is worth stating, since the accounting hides it: in the
+reconnect shape the group holds the *pinned* profile's slot while the request
+streams from the *effective* profile, so that profile carries one uncounted
+provider connection. This is the same under-counting trade-off already documented
+for two devices sharing `(IP, title)` — balanced books, one unattributed
+connection — and it is bounded by the group's lifetime.
+
+`_resolve_effective_profile` logs nothing when it overrides, so it cannot be
+observed directly in a live log; only its effect on the counters can. A live
+check is therefore "play, reconnect/seek, confirm `profile_connections:*` all
+return to 0", not a grep.
 
 ## Multi-worker propagation
 

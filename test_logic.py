@@ -640,6 +640,108 @@ def test_backwards_compatible_with_pre_v0_31_callers():
     patch._reset_ctx()
 
 
+def test_upstream_effective_profile_override():
+    """Upstream can re-point the slot away from our pinned pick (v0.31.0).
+
+    v0.31.0's manager gained `_resolve_effective_profile`, which prefers the
+    profile already bound on the SESSION hash over the view's pick "so reserve
+    and teardown always target the same counter". For a new session the stored
+    id is None and it returns our pick, so the group pin still wins -- but for a
+    session that already has a DIFFERENT profile bound (reconnect, idle-session
+    adoption, create race) upstream overrides us, and then calls OUR patched
+    reserve/decrement with a profile the group never pinned.
+
+    It logs nothing when it overrides, so this cannot be observed in a live log
+    directly -- only its effect on the counters can. That is what these three
+    scenarios assert: whatever upstream re-points, the native profile counter
+    must come back to 0 and native reserve/release must stay symmetric.
+    """
+    print("test_upstream_effective_profile_override")
+    ip, uuid = "10.0.0.5", "content-uuid-effective"
+
+    # --- Scenario 1: create-race swap INSIDE one request (manager:1313-1314) --
+    # The only call site where our pick was already reserved earlier in the same
+    # request (manager:1233), so upstream decrements OUR profile and reserves
+    # ITS profile back to back, with the greenlet context still set. The
+    # decrement consumes the group plan and the reserve has to re-establish it.
+    p3 = FakeProfile(3, max_streams=1, account_id=7)   # group's pinned profile
+    p5 = FakeProfile(5, max_streams=1, account_id=7)   # session's bound profile
+    setup([p3, p5])
+
+    select(FakeAccount(7), ip, uuid)
+    ok_owner, plan_owner = reserve(p3, ip, uuid)
+    check("owner holds the pinned profile", ok_owner and ENV.profile_counts[3] == 1)
+
+    patch._set_ctx(ip, uuid)                       # second request, same greenlet
+    sel = patch.patched_get_m3u_profile(FakeAccount(7), None, None,
+                                        restrict_to_profile_ids=None)
+    check("rider selection returns the pin", bool(sel) and sel[0].id == 3)
+    check("rider rides the pin (manager:1233)",
+          patch.patched_reserve(MGR, p3) is True)
+    patch.patched_decrement(MGR, 3)                # manager:1313, drops our pick
+    check("swap: reserving upstream's effective profile succeeds",
+          patch.patched_reserve(MGR, p5) is True)  # manager:1314
+    plan_rider = patch._snapshot_ctx()
+    check("swap did NOT double-count the native counter",
+          ENV.profile_counts[3] == 1 and ENV.profile_counts.get(5, 0) == 0)
+
+    release(5, plan_rider)                         # rider ends on the swapped id
+    check("slot still held for the owner after the rider leaves",
+          ENV.profile_counts[3] == 1)
+    release(3, plan_owner)
+    check("counter returns to 0 after a swapped-profile request",
+          ENV.profile_counts[3] == 0 and ENV.profile_counts.get(5, 0) == 0)
+    check("native reserve/release stayed symmetric across the swap",
+          ENV.native_reserves == 1 and ENV.native_releases == 1)
+
+    # --- Scenario 2: the same swap when the group has no other member ---------
+    # The leave empties the group (so it IS the last member and DOES release),
+    # and the re-reserve becomes a fresh OWNER on the new profile. Both halves
+    # must be real native calls, or the slot leaks.
+    setup([FakeProfile(3, 1, 7), FakeProfile(5, 1, 7)])
+    patch._set_ctx(ip, uuid)
+    patch.patched_reserve(MGR, ENV.profiles[3])
+    check("solo owner holds the pinned profile", ENV.profile_counts[3] == 1)
+    patch.patched_decrement(MGR, 3)
+    check("solo swap releases the abandoned profile", ENV.profile_counts[3] == 0)
+    check("solo swap re-reserves as a fresh owner",
+          patch.patched_reserve(MGR, ENV.profiles[5]) is True
+          and ENV.profile_counts[5] == 1)
+    plan = patch._snapshot_ctx()
+    release(5, plan)
+    check("solo swap: both counters back to 0",
+          ENV.profile_counts[3] == 0 and ENV.profile_counts[5] == 0)
+    check("solo swap: native reserve/release symmetric",
+          ENV.native_reserves == 2 and ENV.native_releases == 2)
+
+    # --- Scenario 3: reconnect / idle-session reuse (manager:1341, :1361) -----
+    # No prior reserve in this request, so upstream reserves its effective
+    # profile directly. The group is pinned to another profile, so this rides
+    # the group and the effective profile's own counter is never touched.
+    #
+    # NOTE the semantic this encodes: the group holds the PINNED profile's slot
+    # while this request streams from the EFFECTIVE profile, so the effective
+    # profile carries one uncounted provider connection. That is the same
+    # under-counting trade-off already documented in the README for two devices
+    # sharing (IP, title) -- accounting stays balanced, which is what prevents a
+    # leak or a negative counter. Asserted rather than assumed.
+    setup([FakeProfile(3, 1, 7), FakeProfile(5, 1, 7)])
+    select(FakeAccount(7), ip, uuid)
+    _, plan_owner = reserve(ENV.profiles[3], ip, uuid)
+    patch._set_ctx(ip, uuid)
+    check("reconnect on a differently-bound profile rides the group",
+          patch.patched_reserve(MGR, ENV.profiles[5]) is True)
+    plan_reconnect = patch._snapshot_ctx()
+    check("reconnect did not reserve the effective profile natively",
+          ENV.profile_counts.get(5, 0) == 0 and ENV.native_reserves == 1)
+    release(5, plan_reconnect)
+    release(3, plan_owner)
+    check("reconnect: counters back to 0, no negative",
+          ENV.profile_counts[3] == 0 and ENV.profile_counts.get(5, 0) == 0)
+    check("reconnect: exactly one native reserve and one native release",
+          ENV.native_reserves == 1 and ENV.native_releases == 1)
+
+
 def test_manager_hook_signature_parity():
     """The same hardening on the two manager hooks.
 
@@ -687,6 +789,7 @@ if __name__ == "__main__":
     test_selection_signature_parity()
     test_profile_allowlist_is_honoured()
     test_backwards_compatible_with_pre_v0_31_callers()
+    test_upstream_effective_profile_override()
     test_manager_hook_signature_parity()
     print()
     if _failures:
