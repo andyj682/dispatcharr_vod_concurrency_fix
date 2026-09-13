@@ -19,6 +19,18 @@ Checks:
   * Partial-failure rollback keeps the slot for survivors.
   * Generator-close ordering keeps context for the teardown release on client
     disconnect.
+  * Signature parity: an argument the wrapper does not know about is accepted
+    AND forwarded to the original (the class of break that Dispatcharr v0.31.0
+    caused by adding a parameter and passing it unconditionally).
+  * A caller-supplied profile allowlist is honoured rather than overridden by
+    the group pin.
+
+The fakes deliberately mirror the CURRENT upstream call shape: `native_select`
+carries v0.31.0's four-parameter signature and the `select()` helper passes
+`restrict_to_profile_ids=` as a keyword on every call, exactly as
+`_select_vod_stream` does. That is what lets this suite see a signature break at
+all -- the pre-v1.2.0 fakes carried the old three-parameter signature, so the
+suite passed green while the plugin was crashing every VOD request in the field.
 
 Run:  python test_logic.py     (or: py -3 test_logic.py)
 """
@@ -43,6 +55,7 @@ class Env:
         self.profiles = {}         # pid -> FakeProfile
         self.native_capacity = {}  # pid -> max (for native selection stub)
         self.expire_calls = {}     # group_key -> count of EXPIRE refreshes
+        self.native_select_calls = []  # what the wrapper forwarded to native
 
 
 ENV = Env()  # rebound per scenario
@@ -208,14 +221,33 @@ class FakeManager:
         return ENV.profile_counts.get(pid, 0)
 
 
-def native_select(m3u_account, profile_id, session_id=None):
-    """Native selection stub: pick the account's profile if it has capacity."""
+def native_select(m3u_account, profile_id, session_id=None,
+                  restrict_to_profile_ids=None, **unexpected):
+    """Native selection stub, mirroring Dispatcharr v0.31.0's `_get_m3u_profile`.
+
+    Picks the account's profile if it is permitted and has capacity, and honours
+    `restrict_to_profile_ids` the way core does (only listed profile ids on this
+    account are selectable; None means unrestricted).
+
+    `**unexpected` stands in for a parameter a FUTURE Dispatcharr adds, and
+    every call is recorded so tests can assert the wrapper forwarded rather than
+    swallowed what it was given.
+    """
+    ENV.native_select_calls.append({
+        "profile_id": profile_id,
+        "session_id": session_id,
+        "restrict_to_profile_ids": restrict_to_profile_ids,
+        "unexpected": unexpected,
+    })
     for pid, prof in ENV.profiles.items():
-        if prof.m3u_account_id == m3u_account.id:
-            cur = ENV.profile_counts.get(pid, 0)
-            if prof.max_streams == 0 or cur < prof.max_streams:
-                return (prof, cur)
-            return None
+        if prof.m3u_account_id != m3u_account.id:
+            continue
+        if restrict_to_profile_ids is not None and pid not in restrict_to_profile_ids:
+            continue
+        cur = ENV.profile_counts.get(pid, 0)
+        if prof.max_streams == 0 or cur < prof.max_streams:
+            return (prof, cur)
+        return None
     return None
 
 
@@ -242,9 +274,21 @@ def setup(profiles):
     patch._script_cache.clear()
 
 
-def select(account, ip, uuid, profile_id=None):
+def select(account, ip, uuid, profile_id=None, session_id=None,
+           restrict_to_profile_ids=None, **unexpected):
+    """Call the patched selector the way `_select_vod_stream` does.
+
+    Three positional args, then `restrict_to_profile_ids` as a keyword that is
+    ALWAYS present in the call expression -- its value is often None, but the
+    keyword itself is unconditional, which is precisely why a wrapper with a
+    fixed signature raises TypeError at argument binding on v0.31.0.
+    """
     patch._set_ctx(ip, uuid)
-    return patch.patched_get_m3u_profile(account, profile_id)
+    return patch.patched_get_m3u_profile(
+        account, profile_id, session_id,
+        restrict_to_profile_ids=restrict_to_profile_ids,
+        **unexpected,
+    )
 
 
 def reserve(profile, ip, uuid):
@@ -278,7 +322,7 @@ def test_emby_burst():
     p3 = FakeProfile(3, max_streams=1, account_id=7)
     setup([p3])
     acct = FakeAccount(7)
-    ip, uuid = "10.0.0.5", "movie-1905687"
+    ip, uuid = "10.0.0.5", "content-uuid-burst"
 
     # Req #1 (owner): native selection (counter 0 -> ok), then reserve.
     sel1 = select(acct, ip, uuid)
@@ -445,6 +489,194 @@ def test_group_ttl_refresh_during_streaming():
           getattr(patch._local, "plan", None) is None)
 
 
+def test_selection_signature_parity():
+    """Structural guard against the v0.31.0 class of break.
+
+    Dispatcharr added a parameter to `_get_m3u_profile` and its caller passes it
+    unconditionally; a wrapper with a fixed signature raised TypeError while
+    binding arguments -- before any guard or try/except could fail open -- and
+    every VOD request 500'd. This asserts the two properties that survive that:
+    an unknown argument is ACCEPTED, and it is FORWARDED rather than swallowed.
+    """
+    print("test_selection_signature_parity")
+    p3 = FakeProfile(3, max_streams=1, account_id=7)
+    setup([p3])
+    acct = FakeAccount(7)
+    ip, uuid = "10.0.0.5", "content-uuid-parity"
+
+    # No group yet -> native fallthrough, the path core takes on every first
+    # request and the one that must stay byte-for-byte faithful.
+    sel = select(acct, ip, uuid, session_id="sess-1", some_future_option="x")
+    check("unexpected keyword accepted (no TypeError)", bool(sel) and sel[0].id == 3)
+    last = ENV.native_select_calls[-1]
+    check("session_id forwarded", last["session_id"] == "sess-1")
+    check("unexpected keyword forwarded to native",
+          last["unexpected"] == {"some_future_option": "x"})
+    check("restrict keyword forwarded even when None",
+          last["restrict_to_profile_ids"] is None)
+
+    # Same guarantee on the group/rider path's fallthrough, and positionally.
+    reserve(p3, ip, uuid)
+    patch._set_ctx(ip, uuid)
+    sel = patch.patched_get_m3u_profile(acct, None, "sess-2", {4})  # restrict positional
+    check("positional restrict is read, not ignored (pin abandoned)", sel is None)
+    check("positional restrict forwarded to native",
+          ENV.native_select_calls[-1]["restrict_to_profile_ids"] == {4})
+
+    # And the inactive path must forward too, or disabling the plugin would
+    # reintroduce the exact crash it is the documented mitigation for.
+    patch._ACTIVE = False
+    try:
+        sel = select(acct, ip, uuid, session_id="sess-3", some_future_option="y")
+    finally:
+        patch._ACTIVE = True
+    check("inactive wrapper accepts + forwards unknown args",
+          ENV.native_select_calls[-1]["unexpected"] == {"some_future_option": "y"})
+
+
+def test_profile_allowlist_is_honoured():
+    """A caller-supplied allowlist is a constraint; the group pin is not.
+
+    Dispatcharr v0.31.0's per-user M3U profile allowlist reaches selection as
+    `restrict_to_profile_ids`: None (unrestricted) or a set of int profile ids.
+    The rider path returns the pinned profile directly, bypassing core's own
+    filtering, so it has to apply the constraint itself.
+    """
+    print("test_profile_allowlist_is_honoured")
+    p3 = FakeProfile(3, max_streams=1, account_id=7)   # group's account
+    p5 = FakeProfile(5, max_streams=5, account_id=9)   # a different account
+    setup([p3, p5])
+    ip, uuid = "10.0.0.5", "content-uuid-allow"
+
+    select(FakeAccount(7), ip, uuid)
+    reserve(p3, ip, uuid)   # group owner pinned to profile 3 on account 7
+    check("group is confirmed and at capacity", ENV.profile_counts[3] == 1)
+
+    # (a) Unrestricted -> today's behaviour exactly: pin honoured, capacity bypassed.
+    sel = select(FakeAccount(7), ip, uuid, restrict_to_profile_ids=None)
+    check("restrict=None -> pin honoured, capacity bypassed",
+          bool(sel) and sel[0].id == 3)
+
+    # (b) Pin permitted -> still pinned. This is also the int-cast regression:
+    #     Redis stores profile_id as the STRING "3" while the allowlist holds
+    #     the INT 3, so without the cast the check would always fail, the pin
+    #     would always be abandoned, and native (1/1, at capacity) returns None
+    #     -- a silent loss of the plugin's entire benefit.
+    sel = select(FakeAccount(7), ip, uuid, restrict_to_profile_ids={3})
+    check("pin permitted -> pinned profile returned (str/int cast applied)",
+          bool(sel) and sel[0].id == 3)
+
+    # (c) Pin NOT permitted -> abandon the pin and let native decide.
+    n_before = len(ENV.native_select_calls)
+    sel = select(FakeAccount(7), ip, uuid, restrict_to_profile_ids={4})
+    check("pin not permitted -> falls through to native",
+          len(ENV.native_select_calls) == n_before + 1)
+    check("pin not permitted -> allowlist forwarded to native",
+          ENV.native_select_calls[-1]["restrict_to_profile_ids"] == {4})
+    check("pin not permitted -> disallowed profile is NOT returned", sel is None)
+
+    # (d) Empty allowlist (allow nothing) -> pin abandoned, nothing selectable.
+    sel = select(FakeAccount(7), ip, uuid, restrict_to_profile_ids=set())
+    check("empty allowlist -> pin abandoned, nothing selected", sel is None)
+
+    # (e) The cross-account skip is gated by the same check. `restrict` is
+    #     scoped to the candidate account, so it can never contain the group
+    #     account's profile id -- if the skip were not gated, a restricted user
+    #     would have EVERY usable candidate skipped and get "No available
+    #     stream" instead of a working provider.
+    sel = select(FakeAccount(9), ip, uuid, restrict_to_profile_ids={5})
+    check("restricted user is not pinned into an unusable account",
+          bool(sel) and sel[0].id == 5)
+
+    # ...while an unrestricted request still gets the pin (no regression).
+    sel = select(FakeAccount(9), ip, uuid, restrict_to_profile_ids=None)
+    check("unrestricted -> non-group account still skipped (pin intact)",
+          sel is None)
+
+
+def test_backwards_compatible_with_pre_v0_31_callers():
+    """One build must serve Dispatcharr v0.30.0 and earlier too.
+
+    Users upgrade the plugin and Dispatcharr on different days, so the fix has
+    to be a no-op against the OLD three-parameter internals: nothing is passed,
+    so nothing is forwarded. The native stub here carries v0.30.0's exact
+    signature, which means it raises TypeError if the wrapper ever invents an
+    argument to forward.
+    """
+    print("test_backwards_compatible_with_pre_v0_31_callers")
+    p3 = FakeProfile(3, max_streams=1, account_id=7)
+    p5 = FakeProfile(5, max_streams=5, account_id=9)
+    setup([p3, p5])
+
+    def native_select_v0_30(m3u_account, profile_id, session_id=None):
+        """v0.30.0's signature -- no `restrict_to_profile_ids`, no **kwargs."""
+        ENV.native_select_calls.append({"profile_id": profile_id,
+                                        "session_id": session_id})
+        for pid, prof in ENV.profiles.items():
+            if prof.m3u_account_id != m3u_account.id:
+                continue
+            cur = ENV.profile_counts.get(pid, 0)
+            return (prof, cur) if (prof.max_streams == 0
+                                   or cur < prof.max_streams) else None
+        return None
+
+    patch._orig_get_m3u_profile = native_select_v0_30
+    ip, uuid = "10.0.0.5", "content-uuid-legacy"
+
+    # Old caller shape: three positional args, no restrict keyword at all.
+    patch._set_ctx(ip, uuid)
+    sel = patch.patched_get_m3u_profile(FakeAccount(7), None, None)
+    check("v0.30.0 caller + v0.30.0 native: selection works",
+          bool(sel) and sel[0].id == 3)
+
+    reserve(p3, ip, uuid)
+    patch._set_ctx(ip, uuid)
+    sel = patch.patched_get_m3u_profile(FakeAccount(7), None, None)
+    check("v0.30.0: rider still bypasses capacity (coalescing intact)",
+          bool(sel) and sel[0].id == 3)
+    patch._set_ctx(ip, uuid)
+    sel = patch.patched_get_m3u_profile(FakeAccount(9), None, None)
+    check("v0.30.0: non-group account still skipped (pin intact)", sel is None)
+    patch._reset_ctx()
+
+
+def test_manager_hook_signature_parity():
+    """The same hardening on the two manager hooks.
+
+    Their signatures match core today and all call sites pass one positional
+    argument -- but this release is proof that "matches today" is not durable,
+    and the cost of accepting/forwarding is nil.
+    """
+    print("test_manager_hook_signature_parity")
+    p3 = FakeProfile(3, max_streams=2, account_id=7)
+    setup([p3])
+    seen = {}
+
+    def recording_reserve(self, profile, *args, **kwargs):
+        seen["reserve"] = (args, kwargs)
+        return FakeManager._orig_reserve(self, profile)
+
+    def recording_decrement(self, pid, *args, **kwargs):
+        seen["decrement"] = (args, kwargs)
+        return FakeManager._orig_decrement(self, pid)
+
+    patch._orig_reserve = recording_reserve
+    patch._orig_decrement = recording_decrement
+
+    patch._set_ctx("10.0.0.5", "content-uuid-hooks")
+    ok = patch.patched_reserve(MGR, p3, "future_positional", future_kw=1)
+    check("reserve accepts unexpected args (no TypeError)", ok is True)
+    check("reserve forwards unexpected args to native",
+          seen.get("reserve") == (("future_positional",), {"future_kw": 1}))
+
+    patch.patched_decrement(MGR, 3, "future_positional", future_kw=2)
+    check("decrement accepts + forwards unexpected args",
+          seen.get("decrement") == (("future_positional",), {"future_kw": 2}))
+    check("slot released exactly once despite the extra args",
+          ENV.profile_counts[3] == 0)
+    patch._reset_ctx()
+
+
 if __name__ == "__main__":
     test_emby_burst()
     test_rider_pins_to_group_account()
@@ -452,6 +684,10 @@ if __name__ == "__main__":
     test_partial_failure_keeps_slot()
     test_generator_close_ordering()
     test_group_ttl_refresh_during_streaming()
+    test_selection_signature_parity()
+    test_profile_allowlist_is_honoured()
+    test_backwards_compatible_with_pre_v0_31_callers()
+    test_manager_hook_signature_parity()
     print()
     if _failures:
         print(f"{len(_failures)} check(s) FAILED: {_failures}")

@@ -1,6 +1,9 @@
 # VOD concurrency fix — design resolution
 
-Grounded in current Dispatcharr `main` (cloned 2026-07-27, commit `1835d24`).
+Grounded in Dispatcharr `main` (cloned 2026-07-27, commit `1835d24`).
+Re-verified against **v0.31.0** for plugin v1.2.0: both manager hooks are
+byte-identical to v0.30.0, and `_get_m3u_profile` gained one parameter — see
+"Signature-agnostic wrappers" and "Per-user profile allowlists" below.
 
 ## Root cause (confirmed in source AND in Andy's live logs)
 
@@ -101,6 +104,102 @@ raised to 60s for pause cushion. Residual edge: a *pause* longer than the TTL
 with the connection held open (no bytes flowing → no refresh) could still let the
 group lapse; rare, and no worse than pre-v1.1.0.
 
+## Signature-agnostic wrappers (v1.2.0)
+
+Dispatcharr v0.31.0 changed `_get_m3u_profile`:
+
+```
+v0.30.0:  _get_m3u_profile(m3u_account, profile_id, session_id=None)
+v0.31.0:  _get_m3u_profile(m3u_account, profile_id, session_id=None,
+                           restrict_to_profile_ids=None)
+```
+
+Its one production caller, `_select_vod_stream`, passes the new parameter **as a
+keyword, unconditionally** — the *value* is usually `None`, but the keyword is
+always present in the call expression. Our wrapper's fixed three-parameter
+signature therefore raised `TypeError`, and `stream_vod` wraps its whole body in
+a blanket `except Exception` that returns a 500. Result: **every VOD playback
+request 500'd** while the plugin was enabled on v0.31.0.
+
+The important lesson is about the *failure mode*, not the parameter. This
+plugin's safety story was "any error falls back to native," but argument binding
+happens **before the function body**, so neither the `if not _ACTIVE` guard nor
+the wrapper's `try/except` ever ran. A signature mismatch is the one class of
+upstream change that a fail-open monkeypatch cannot absorb — and it converts the
+usual quiet "plugin silently stopped helping" into a hard outage. Disabling the
+plugin's own feature setting wouldn't have helped either, for the same reason;
+only fully disabling the plugin (which restores the original function object)
+did.
+
+So every wrapper now ends its signature with `*args, **kwargs` and forwards them
+verbatim to the original — `patched_get_m3u_profile`, and also `patched_reserve`
+/ `patched_decrement`, whose signatures still match core but which are the same
+kind of exposure. Forwarding matters as much as accepting: swallowing a
+selection constraint would silently hand users profiles they aren't permitted to
+use, which is worse than a crash because nothing surfaces it.
+
+`test_logic.py` now carries a structural guard for this (an unrecognised
+argument must be accepted *and* observed arriving at the original) plus a test
+pinning the wrapper against v0.30.0's older signature, so one build serves both.
+This matters because the previous suite **passed green while the plugin was
+crashing every request in the field** — its fakes carried the old signature, so
+it was structurally incapable of seeing the break. A logic test that mirrors
+only the call shapes you already handle cannot detect a compatibility break; the
+fakes have to track upstream's signature.
+
+## Per-user profile allowlists (v0.31.0)
+
+v0.31.0 also added a per-user M3U profile allowlist. `get_allowed_m3u_profiles`
+reads `user.custom_properties.allowed_m3u_profile_ids` as a tri-state (absent →
+unrestricted, `[]` → allow nothing, `[ids]` → those active profiles, malformed →
+fails closed) and returns profiles **grouped by account**; `_select_vod_stream`
+then derives a per-candidate-account `restrict_to_profile_ids`, so what reaches
+selection is `None` or a set of int profile ids.
+
+The group/rider path returns the pinned profile **directly**, bypassing core's
+selection and therefore its allowlist filtering, so it has to apply the
+constraint itself. The pin is an optimisation; the allowlist is a constraint, so
+the constraint wins:
+
+```python
+restrict = kwargs.get("restrict_to_profile_ids")
+if restrict is None and args:
+    restrict = args[0]
+if restrict is not None and _as_int(group_profile_id) not in restrict:
+    # abandon the pin; let native selection decide
+```
+
+One check, placed before both branches, because both bypass core's filtering:
+
+- **the group's own account** — we must not hand back a profile this request may
+  not use;
+- **any other account** (the `return None` pin) — if the skip weren't gated, a
+  restricted user could have every candidate they *can* use skipped, turning a
+  playable request into "No available stream".
+
+Two details worth stating because both are silent when wrong:
+
+- `group_profile_id` comes out of Redis as a **string** while the allowlist holds
+  **ints**. Without the `int()` cast the check always fails, the pin is always
+  abandoned, and the plugin quietly stops doing its job — no error anywhere.
+- `restrict` is scoped to the **candidate account** being tested, so for a
+  non-group account it can never contain the group account's profile id. The
+  practical consequence: whenever allowlists are in play, the cross-account pin
+  stands down and native selection decides. That is the intended graceful
+  degradation, not an oversight — correctly serving a restricted user matters
+  more than coalescing them.
+
+Cost when the feature is unused — the default, and every Dispatcharr before
+v0.31.0 — is one `is None` identity comparison per call, and behaviour is
+unchanged.
+
+**Known limitation, deliberately not fixed here.** The group key is
+`(client_ip, content_uuid)` — **user-agnostic**. Two users behind one client IP
+with different allowlists share a group. The check above degrades that
+gracefully and per-request, which is the right trade-off. Scoping the group key
+by user id would be more precise, but it changes the Redis key format and needs
+a migration story, so it is out of scope for a compatibility release.
+
 ## Why context threading is safe (the part the old plugin got wrong)
 
 Dispatcharr runs uWSGI with `gevent = 400` + `gevent-early-monkey-patch`, so
@@ -144,9 +243,23 @@ an over-subscription).
 - Abrupt-crash leak is bounded by the group TTL and recovered by Dispatcharr's
   own stale-connection cleanup (our decrement falls back to a raw native
   decrement when it runs outside a request) — no worse than stock.
-- Fail-safe: if internals change, `install()` refuses to patch; any per-request
-  error falls back to native. Failure mode is "no coalescing," never "broken
-  streaming."
+- Fail-safe, **with one documented exception**: if the internals go missing,
+  `install()` refuses to patch, and any per-request error falls back to native,
+  so the failure mode is "no coalescing," not "broken streaming." That does
+  **not** hold for a changed *signature* on a patched function — see
+  "Signature-agnostic wrappers" below.
+
+## Adjacent upstream machinery to watch
+
+v0.31.0's connection manager grew a `_resolve_effective_profile(existing_state,
+fallback_profile, ...)` that prefers the profile already bound on the **session
+hash** over the view's pick, "so reserve and teardown always target the same
+counter". For a *new* session the stored id is `None` and it returns the view's
+pick — i.e. ours — so the group pin still wins, which is why no change was
+needed here. It only overrides for a session that already has a profile bound
+(reconnect / idle-session reuse), where holding the existing counter is the
+correct behaviour anyway. Worth knowing because it is now the one place upstream
+can override our selection.
 
 ## Multi-worker propagation
 

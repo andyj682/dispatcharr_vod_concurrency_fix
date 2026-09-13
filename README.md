@@ -1,5 +1,24 @@
 # Dispatcharr VOD Concurrency Fix (plugin)
 
+> ### ⚠️ Running Dispatcharr v0.31.0 or newer? You need plugin v1.2.0.
+>
+> **Plugin v1.1.0 and earlier break all VOD playback on Dispatcharr v0.31.0**
+> (every VOD request returns `HTTP 500 Streaming error`). v0.31.0 added a
+> parameter to an internal function this plugin wraps; the old wrapper rejects
+> it while Python is binding arguments, which happens *before* any of the
+> plugin's own error handling can fall back to native behaviour. Live TV is
+> unaffected.
+>
+> **Fix:** upgrade to v1.2.0.
+> **Immediate workaround if you can't upgrade right now:** **disable the plugin**
+> in the Dispatcharr UI (Plugins → toggle off). That restores the original
+> function and VOD works again — no Dispatcharr rollback needed. Note this means
+> the plugin's *enabled* toggle; there is no per-feature setting that helps,
+> because the failure happens before any setting is read.
+>
+> v1.2.0 runs on **v0.31.0 and on v0.30.0 and earlier** — one build covers both,
+> so it is safe to upgrade the plugin before or after Dispatcharr.
+
 Plugin for Dispatcharr that stops overlapping VOD requests from one client —
 the MKV "open-file burst" (2–3 near-simultaneous HTTP range requests) at start,
 **and a seek** (a new connection that opens before the old one closes) — from
@@ -18,8 +37,15 @@ once). See `DESIGN.md` for the full rationale and `patch.py` for the code.
 - No configuration needed. No user data collected.
 
 *Targets current Dispatcharr's multi-worker VOD proxy. If the internals it
-patches change — or a request hits an unexpected error — it falls back to native
-behavior (no coalescing) rather than breaking playback.*
+patches go missing — or a request hits an unexpected error — it falls back to
+native behavior (no coalescing) rather than breaking playback.*
+
+*One caveat, learned from v0.31.0: that fail-open cannot cover a changed
+**signature** on a patched function. Python raises `TypeError` while binding the
+arguments, before the wrapper body — and therefore before any guard or
+`try/except` — runs. v1.2.0 closes this off by making every wrapper accept and
+forward arguments it doesn't recognise, so a future added parameter is a no-op
+rather than an outage.*
 
 ---
 
@@ -125,6 +151,14 @@ different-client, partial-failure, and client-disconnect teardown — asserting
 the selection ladder and one-reserve / one-release symmetry. No Dispatcharr or
 Redis required.
 
+It also covers the two things v1.2.0 is about: **signature parity** (an argument
+the wrapper doesn't recognise must be accepted *and* forwarded — the guard that
+would have caught the v0.31.0 break before it shipped) and **profile
+allowlists** (permitted → pinned; not permitted or empty → native fallthrough;
+unrestricted → unchanged). The fakes mirror v0.31.0's call shape, and one test
+pins the wrapper against v0.30.0's older shape so a single build is proven on
+both.
+
 ---
 
 ## Limitations / potential fail points
@@ -182,6 +216,21 @@ touched.
    Dispatcharr's own stale-connection cleanup still recovers the native counter
    (our decrement falls back to a raw native decrement outside a request
    context). No worse than stock, and scoped to one (ip, content).
+
+7. **Per-user M3U profile allowlists: the group key is user-agnostic.**
+   Dispatcharr v0.31.0 added per-user profile allowlists
+   (`allowed_m3u_profile_ids`). The plugin honours them — if a group's pinned
+   profile isn't permitted for a request, the pin is abandoned and native
+   selection decides, so a restricted user never receives a profile they aren't
+   allowed to use. But groups are keyed by `(client IP, content)` with **no user
+   component**, so two users behind one IP watching the same title share a
+   group. The degradation is graceful and per-request (whoever can't use the pin
+   simply falls back to native), and in practice this means **coalescing stands
+   down for allowlist-restricted requests** rather than misbehaving. Scoping the
+   group key by user id would be more precise but changes the Redis key format;
+   it's deliberately deferred. If you don't use allowlists (the default — the
+   feature is off unless you set it), nothing here applies and behaviour is
+   identical to v1.1.0.
 
 **Context safety:** the `(ip, content)` context lives in a greenlet-local that
 is set at the top of `stream_vod` and always reset at request end (the streaming

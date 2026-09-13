@@ -85,6 +85,20 @@ workers are patched; confirm from the per-worker `[VOD-CC] active ... pid=` logs
 This module is import-safe: any failure to locate/patch the current Dispatcharr
 internals leaves native behaviour completely untouched, and any per-request
 error falls back to native.
+
+Signature-agnostic wrappers
+---------------------------
+That fail-open has one blind spot, found the hard way on Dispatcharr v0.31.0: it
+cannot cover a changed *signature* on a patched function. Python raises
+TypeError while binding arguments, before the wrapper body -- so before the
+`if not _ACTIVE` guard and before the try/except. `stream_vod`'s blanket
+`except Exception` then turned that into HTTP 500 on every VOD request.
+
+So every wrapper here accepts `*args/**kwargs` and forwards them verbatim to the
+original, which makes a newly-added upstream parameter a no-op instead of an
+outage. Forwarding is as important as accepting: silently dropping a parameter
+like v0.31.0's `restrict_to_profile_ids` would hand users profiles they are not
+permitted to use -- worse than a crash, because nothing surfaces it.
 """
 
 from __future__ import annotations
@@ -246,6 +260,18 @@ def _decode(v):
     return v.decode() if isinstance(v, (bytes, bytearray)) else v
 
 
+def _as_int(value):
+    """Redis hands ids back as strings; Dispatcharr's allowlists hold ints.
+
+    Returns None when the value can't be read as an int, so callers fail closed
+    (an id we cannot parse is an id we cannot prove is permitted).
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _reset_ctx() -> None:
     _local.client_ip = None
     _local.content_uuid = None
@@ -280,7 +306,7 @@ def _restore_ctx(snap: dict) -> None:
 # Patched: _get_m3u_profile (selection)
 # --------------------------------------------------------------------------- #
 
-def patched_get_m3u_profile(m3u_account, profile_id, session_id=None):
+def patched_get_m3u_profile(m3u_account, profile_id, session_id=None, *args, **kwargs):
     """Group-aware profile selection.
 
     If a confirmed group exists for this request's (client_ip, content_uuid):
@@ -290,21 +316,32 @@ def patched_get_m3u_profile(m3u_account, profile_id, session_id=None):
         the candidate loop skips it and stays pinned to the group's account
         (keeps the burst on one provider/file).
     Otherwise behave exactly like native selection.
+
+    The `*args/**kwargs` tail is deliberate and load-bearing. Dispatcharr
+    v0.31.0 added a `restrict_to_profile_ids` parameter and its caller passes it
+    UNCONDITIONALLY as a keyword, so a wrapper with a fixed signature raises
+    TypeError while binding arguments -- before `if not _ACTIVE` and before the
+    try/except below, which is why this plugin's usual fail-open could not catch
+    it and every VOD request 500'd. Accepting anything and forwarding it
+    verbatim makes the next added parameter a no-op for us instead of an outage.
+    Forwarding matters as much as accepting: silently dropping a selection
+    constraint would hand users profiles they are not permitted to use, which is
+    worse than a crash because it is invisible.
     """
     if not _ACTIVE:
-        return _orig_get_m3u_profile(m3u_account, profile_id, session_id)
+        return _orig_get_m3u_profile(m3u_account, profile_id, session_id, *args, **kwargs)
 
     _log_pid_once("select")
 
     client_ip = getattr(_local, "client_ip", None)
     content_uuid = getattr(_local, "content_uuid", None)
     if client_ip is None or content_uuid is None or m3u_account is None:
-        return _orig_get_m3u_profile(m3u_account, profile_id, session_id)
+        return _orig_get_m3u_profile(m3u_account, profile_id, session_id, *args, **kwargs)
 
     try:
         redis_client = _get_redis()
         if redis_client is None:
-            return _orig_get_m3u_profile(m3u_account, profile_id, session_id)
+            return _orig_get_m3u_profile(m3u_account, profile_id, session_id, *args, **kwargs)
 
         gkey = _group_key(client_ip, content_uuid)
         raw = redis_client.hgetall(gkey)
@@ -313,6 +350,37 @@ def patched_get_m3u_profile(m3u_account, profile_id, session_id=None):
             if data.get("reserved") == "1" and data.get("profile_id") and data.get("account_id"):
                 group_account_id = str(data["account_id"])
                 group_profile_id = str(data["profile_id"])
+
+                # The group pin is an OPTIMISATION; a caller-supplied profile
+                # allowlist is a CONSTRAINT, so the constraint wins. Read it
+                # defensively -- core passes it by keyword, but positional is
+                # cheap to support.
+                restrict = kwargs.get("restrict_to_profile_ids")
+                if restrict is None and args:
+                    restrict = args[0]
+
+                # One check covering BOTH branches below, because both bypass
+                # core's own allowlist filtering:
+                #   * group's account -- we must not hand back a profile this
+                #     request may not use;
+                #   * other accounts  -- the `return None` pin would otherwise
+                #     skip every candidate the user CAN use, turning a
+                #     restricted playback into "No available stream".
+                # Note `restrict` is scoped to THIS candidate account, so for a
+                # non-group account it can never contain the group's profile id
+                # -- i.e. whenever the allowlist feature is in play the
+                # cross-account pin correctly stands down and native selection
+                # decides. Unrestricted requests (the default, and every
+                # Dispatcharr before v0.31.0) short-circuit on `is None` and see
+                # no behaviour change at all.
+                if restrict is not None and _as_int(group_profile_id) not in restrict:
+                    logger.info(
+                        "[VOD-CC] group profile %s not permitted for this request; "
+                        "abandoning pin, using native selection", group_profile_id,
+                    )
+                    return _orig_get_m3u_profile(
+                        m3u_account, profile_id, session_id, *args, **kwargs
+                    )
 
                 if str(m3u_account.id) == group_account_id:
                     # This is the group's account: return its profile, bypass capacity.
@@ -344,12 +412,12 @@ def patched_get_m3u_profile(m3u_account, profile_id, session_id=None):
                     )
                     return None
 
-        return _orig_get_m3u_profile(m3u_account, profile_id, session_id)
+        return _orig_get_m3u_profile(m3u_account, profile_id, session_id, *args, **kwargs)
 
     except Exception as exc:
         logger.error("[VOD-CC] selection error, falling back to native: %s", exc)
         try:
-            return _orig_get_m3u_profile(m3u_account, profile_id, session_id)
+            return _orig_get_m3u_profile(m3u_account, profile_id, session_id, *args, **kwargs)
         except Exception:
             raise
 
@@ -358,28 +426,34 @@ def patched_get_m3u_profile(m3u_account, profile_id, session_id=None):
 # Patched: reserve
 # --------------------------------------------------------------------------- #
 
-def patched_reserve(self, m3u_profile):
-    """Group-aware replacement for `_check_and_reserve_profile_slot`."""
+def patched_reserve(self, m3u_profile, *args, **kwargs):
+    """Group-aware replacement for `_check_and_reserve_profile_slot`.
+
+    Core's call sites pass one positional argument today, but "matches today" is
+    not durable -- see the note on `patched_get_m3u_profile`. Accepting and
+    forwarding anything extra costs nothing and removes this hook as a future
+    break surface.
+    """
     if not _ACTIVE:
-        return _orig_reserve(self, m3u_profile)
+        return _orig_reserve(self, m3u_profile, *args, **kwargs)
 
     _log_pid_once("reserve")
 
     client_ip = getattr(_local, "client_ip", None)
     content_uuid = getattr(_local, "content_uuid", None)
     if client_ip is None or content_uuid is None or m3u_profile is None:
-        return _orig_reserve(self, m3u_profile)
+        return _orig_reserve(self, m3u_profile, *args, **kwargs)
     try:
         max_streams = int(getattr(m3u_profile, "max_streams", 0) or 0)
     except (TypeError, ValueError):
         max_streams = 0
     if max_streams == 0:
-        return _orig_reserve(self, m3u_profile)
+        return _orig_reserve(self, m3u_profile, *args, **kwargs)
 
     try:
         redis_client = getattr(self, "redis_client", None) or _get_redis()
         if redis_client is None:
-            return _orig_reserve(self, m3u_profile)
+            return _orig_reserve(self, m3u_profile, *args, **kwargs)
 
         scripts = _get_scripts(redis_client)
         gkey = _group_key(client_ip, content_uuid)
@@ -391,7 +465,7 @@ def patched_reserve(self, m3u_profile):
         reserved = int(reserved)
 
         if rc == 1:
-            ok = _orig_reserve(self, m3u_profile)
+            ok = _orig_reserve(self, m3u_profile, *args, **kwargs)
             if ok:
                 scripts["mark"](
                     keys=[gkey],
@@ -425,7 +499,7 @@ def patched_reserve(self, m3u_profile):
         # rc > 1 but owner not confirmed yet (sub-ms race the real burst doesn't
         # exhibit): back out and reserve independently -> never ride a phantom slot.
         scripts["undo"](keys=[gkey], args=[])
-        ok = _orig_reserve(self, m3u_profile)
+        ok = _orig_reserve(self, m3u_profile, *args, **kwargs)
         _local.plan = "INDEP" if ok else "NONE"
         _local.group_key = gkey
         return ok
@@ -433,7 +507,7 @@ def patched_reserve(self, m3u_profile):
     except Exception as exc:
         logger.error("[VOD-CC] reserve error, falling back to native: %s", exc)
         try:
-            return _orig_reserve(self, m3u_profile)
+            return _orig_reserve(self, m3u_profile, *args, **kwargs)
         except Exception:
             raise
 
@@ -442,15 +516,18 @@ def patched_reserve(self, m3u_profile):
 # Patched: decrement / release
 # --------------------------------------------------------------------------- #
 
-def patched_decrement(self, m3u_profile_id):
-    """Group-aware replacement for `_decrement_profile_connections`."""
+def patched_decrement(self, m3u_profile_id, *args, **kwargs):
+    """Group-aware replacement for `_decrement_profile_connections`.
+
+    Same signature-agnostic hardening as `patched_reserve`.
+    """
     if not _ACTIVE:
-        return _orig_decrement(self, m3u_profile_id)
+        return _orig_decrement(self, m3u_profile_id, *args, **kwargs)
 
     plan = getattr(_local, "plan", None)
     gkey = getattr(_local, "group_key", None)
     if plan is None:
-        return _orig_decrement(self, m3u_profile_id)
+        return _orig_decrement(self, m3u_profile_id, *args, **kwargs)
 
     # Consume the plan so a stray second decrement can't double-act.
     _local.plan = None
@@ -460,12 +537,12 @@ def patched_decrement(self, m3u_profile_id):
         if plan == "NONE":
             return None
         if plan == "INDEP":
-            return _orig_decrement(self, m3u_profile_id)
+            return _orig_decrement(self, m3u_profile_id, *args, **kwargs)
 
         # plan == "GROUP"
         redis_client = getattr(self, "redis_client", None) or _get_redis()
         if redis_client is None or gkey is None:
-            return _orig_decrement(self, m3u_profile_id)
+            return _orig_decrement(self, m3u_profile_id, *args, **kwargs)
 
         scripts = _get_scripts(redis_client)
         code, rc = scripts["leave"](
@@ -476,7 +553,7 @@ def patched_decrement(self, m3u_profile_id):
             logger.info(
                 "[VOD-CC] group LAST member -> releasing profile %s", m3u_profile_id
             )
-            return _orig_decrement(self, m3u_profile_id)
+            return _orig_decrement(self, m3u_profile_id, *args, **kwargs)
 
         logger.info(
             "[VOD-CC] group member left profile %s, %s remain (slot held)",
@@ -487,7 +564,7 @@ def patched_decrement(self, m3u_profile_id):
     except Exception as exc:
         logger.error("[VOD-CC] decrement error, falling back to native: %s", exc)
         try:
-            return _orig_decrement(self, m3u_profile_id)
+            return _orig_decrement(self, m3u_profile_id, *args, **kwargs)
         except Exception:
             raise
 
