@@ -110,6 +110,40 @@ import time
 
 logger = logging.getLogger("plugins.dispatcharr_vod_concurrency_fix")
 
+
+def _align_logger_level() -> None:
+    """Give this plugin's logger its own level instead of inheriting root's.
+
+    Dispatcharr's LOGGING dictConfig names every logger it manages -- `apps`,
+    `apps.proxy`, `celery`, `core.tasks`, `django.geventpool`, root -- and gives
+    each an explicit handler with `propagate: False`. **`plugins.*` is not in
+    that list**, so a plugin logger has no handler, propagates to root, and its
+    effective level IS root's.
+
+    That is fine in uWSGI and daphne (root sits at DISPATCHARR_LOG_LEVEL, INFO
+    by default), which is where everything this plugin patches runs -- so there
+    is no exposure today. It is NOT fine in a Celery prefork child, where
+    billiard reconfigures root and leaves it at WARNING: every plugin
+    `logger.info()` is then discarded at the logger, while core's `apps.*` lines
+    from the same process still appear because that logger has its own level.
+    A working plugin becomes indistinguishable from an absent one -- a failure
+    you can only notice as an absence, which is to say you don't.
+
+    All of this plugin's diagnostics (`[VOD-CC] ...`, the per-worker residency
+    lines) are INFO, so they are exactly what would vanish. Taken preventively:
+    if this code ever runs somewhere root has been turned down, it stays visible.
+
+    Adopt `apps`'s level rather than hard-coding INFO so DISPATCHARR_LOG_LEVEL
+    keeps working, and only act when the level is NOTSET so anything that has
+    already set one (a test silencing this logger, an operator debugging) keeps
+    control.
+    """
+    if logger.level == logging.NOTSET:
+        logger.setLevel(logging.getLogger("apps").getEffectiveLevel() or logging.INFO)
+
+
+_align_logger_level()
+
 # --------------------------------------------------------------------------- #
 # Tunables
 # --------------------------------------------------------------------------- #

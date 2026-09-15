@@ -299,6 +299,34 @@ applies the patches. Enable + **restart** to guarantee all workers; confirm from
 the per-worker `[VOD-CC] active … pid=` logs. Runtime enable-without-restart
 relies on the loader's `.reload_token` pull and isn't guaranteed prompt.
 
+## Logger level (why the plugin sets its own)
+
+Dispatcharr's `LOGGING` dictConfig names every logger it manages — `apps`,
+`apps.proxy`, `celery`, `core.tasks`, `django.geventpool`, root — and gives each
+an explicit handler with `propagate: False`. **`plugins.*` is not in that list**,
+so a plugin logger has no handler of its own, propagates to root, and its
+effective level *is* root's.
+
+That is fine everywhere this plugin actually runs: uWSGI and daphne keep root at
+`DISPATCHARR_LOG_LEVEL` (INFO by default). It is not fine in a Celery prefork
+child, where billiard reconfigures root and leaves it at WARNING — every plugin
+`logger.info()` is then dropped at the logger, while core's `apps.*` lines from
+the same process still appear because that logger carries its own level. Since
+all of this plugin's diagnostics are INFO, the result would be a working plugin
+that looks like an absent one.
+
+So `patch.py` gives the logger an explicit level at import, adopting `apps`'s
+level (which keeps `DISPATCHARR_LOG_LEVEL` effective) and only when the level is
+still `NOTSET` (so a test or an operator that already set one keeps control).
+
+**This is preventive, not a fix for an observed problem here** — nothing this
+plugin patches runs in a prefork child. It is worth having anyway because the
+failure mode is an *absence*: you would only learn you needed it by failing to
+find a log line, which is indistinguishable from the plugin not being loaded.
+That exact confusion cost a sibling plugin a long investigation. The proper fix
+is upstream — one `"plugins"` entry in `LOGGING["loggers"]` — but the
+plugin-side guard works on releases that predate it.
+
 ## Upstreaming note
 
 The equivalent logic could land directly in `_get_m3u_profile` /

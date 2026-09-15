@@ -742,6 +742,43 @@ def test_upstream_effective_profile_override():
           ENV.native_reserves == 1 and ENV.native_releases == 1)
 
 
+def test_logger_has_its_own_level():
+    """The plugin logger must not inherit root's level.
+
+    Dispatcharr's LOGGING dictConfig does not name `plugins.*`, so without this
+    the logger's effective level is root's. In a Celery prefork child billiard
+    leaves root at WARNING, which silently discards every INFO line this plugin
+    emits -- i.e. all of its diagnostics -- while core's `apps.*` lines from the
+    same process still show up. Nothing this plugin patches runs in a prefork
+    child today, so this is preventive; the point is that the failure mode is an
+    *absence*, which nobody notices.
+    """
+    print("test_logger_has_its_own_level")
+    import logging
+
+    check("logger has an explicit level after import (not NOTSET)",
+          patch.logger.level != logging.NOTSET)
+
+    # Adopts `apps`'s level so DISPATCHARR_LOG_LEVEL stays effective, rather
+    # than hard-coding INFO.
+    logging.getLogger("apps").setLevel(logging.DEBUG)
+    patch.logger.setLevel(logging.NOTSET)
+    patch._align_logger_level()
+    check("adopts the `apps` logger's level, not a hard-coded INFO",
+          patch.logger.level == logging.DEBUG)
+
+    # The NOTSET guard: anything that already set a level keeps control.
+    patch.logger.setLevel(logging.CRITICAL)
+    patch._align_logger_level()
+    check("an already-set level is left alone (NOTSET guard)",
+          patch.logger.level == logging.CRITICAL)
+
+    # Leave the logger in a sane state for any later test output.
+    patch.logger.setLevel(logging.NOTSET)
+    logging.getLogger("apps").setLevel(logging.NOTSET)
+    patch._align_logger_level()
+
+
 def test_manager_hook_signature_parity():
     """The same hardening on the two manager hooks.
 
@@ -790,6 +827,7 @@ if __name__ == "__main__":
     test_profile_allowlist_is_honoured()
     test_backwards_compatible_with_pre_v0_31_callers()
     test_upstream_effective_profile_override()
+    test_logger_has_its_own_level()
     test_manager_hook_signature_parity()
     print()
     if _failures:
