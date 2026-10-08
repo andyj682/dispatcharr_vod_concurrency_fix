@@ -19,6 +19,20 @@
 > v1.2.0 runs on **v0.31.0 and on v0.30.0 and earlier** — one build covers both,
 > so it is safe to upgrade the plugin before or after Dispatcharr.
 
+> ### Running Dispatcharr v0.32.0? Use plugin v1.3.0.
+>
+> v0.32.0 lets some players keep a whole burst on one Dispatcharr session
+> (FFmpeg-based players that reuse its now-cacheable session redirect). With
+> those players, v1.2.0 could occasionally leave a quick stop-and-replay
+> uncounted, so a second stream could be let onto a full provider. v1.3.0
+> tracks the coalescing group by session and fixes that. **Emby is not
+> affected** (its requests come from the Emby server, which doesn't reuse the
+> redirect), but v1.3.0 is the right build for v0.32.0 either way.
+>
+> v0.32.0's own redirect change does **not** fix the burst failover for Emby,
+> so the plugin is still needed there. v1.3.0 runs on v0.30.0, v0.31.0 and
+> v0.32.0.
+
 Plugin for Dispatcharr that stops overlapping VOD requests from one client —
 the MKV "open-file burst" (2–3 near-simultaneous HTTP range requests) at start,
 **and a seek** (a new connection that opens before the old one closes) — from
@@ -147,9 +161,11 @@ docker logs <dispatcharr-container> 2>&1 | grep -E "VOD-CC|VOD-FAILOVER|PROFILE-
 python test_logic.py
 ```
 Simulates the burst (selection bypass + rider), account pinning,
-different-client, partial-failure, and client-disconnect teardown — asserting
-the selection ladder and one-reserve / one-release symmetry. No Dispatcharr or
-Redis required.
+different-client, partial failure, and every way a response can end — asserting
+the selection ladder and one-reserve / one-release symmetry. No Dispatcharr,
+Django or Redis required: it models Django's streaming response, Dispatcharr
+v0.32.0's per-session accounting (including bursts that share one session), and
+per-request greenlet context.
 
 It also covers the two things v1.2.0 is about: **signature parity** (an argument
 the wrapper doesn't recognise must be accepted *and* forwarded — the guard that
@@ -232,18 +248,20 @@ touched.
    feature is off unless you set it), nothing here applies and behaviour is
    identical to v1.1.0.
 
-**Context safety:** the `(ip, content)` context lives in a greenlet-local that
-is set at the top of `stream_vod` and always reset at request end (the streaming
-generator's `finally`, or the non-streaming/`except` paths). Combined with
-uWSGI/gevent using a fresh greenlet per request, a prior request's context
-cannot bleed into a later one.
+**Context safety:** the `(ip, content, session)` context lives in a
+greenlet-local that is set at the top of `stream_vod` and always reset at request
+end — when the stream ends or is closed (including a response closed before it
+started), or on the non-streaming/`except` paths. Combined with uWSGI/gevent
+using a fresh greenlet per request, a prior request's context cannot bleed into
+a later one.
 
 ## Redis keys used
 
 - `vodcc:grp:{client_ip}:{content_uuid}` — hash: `refcount`, `reserved`,
-  `profile_id`, `account_id`, `created_at`, `last_activity`; TTL
+  `profile_id`, `account_id`, `created_at`, `last_activity`, plus one
+  `m:{session_id}` member count per member session (v1.3.0); TTL
   `GROUP_TTL_SECONDS` (60s), refreshed on reserve/release events **and
-  periodically while a connection is streaming** (so a mid-playback **seek** —
+  periodically while a member session is streaming** (so a mid-playback **seek** —
   a new connection opening before the old one closes — finds the group and rides
   it instead of failing over). Deliberately distinct from
   the older `cedric-marcoux/dispatcharr_vod_fix` plugin's `vod_client_slot:`

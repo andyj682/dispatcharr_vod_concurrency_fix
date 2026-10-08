@@ -4,6 +4,10 @@ Grounded in Dispatcharr `main` (cloned 2026-07-27, commit `1835d24`).
 Re-verified against **v0.31.0** for plugin v1.2.0: both manager hooks are
 byte-identical to v0.30.0, and `_get_m3u_profile` gained one parameter — see
 "Signature-agnostic wrappers" and "Per-user profile allowlists" below.
+Re-verified against **v0.32.0** for plugin v1.3.0: every hook is still
+byte-identical, but v0.32.0 changed how a burst can arrive (one session instead
+of one per request, for clients that reuse its now-cacheable session redirect)
+— see "Session-level membership (v1.3.0)" below.
 
 ## Root cause (confirmed in source AND in Andy's live logs)
 
@@ -44,7 +48,8 @@ coordinated monkeypatches (this is the same shape as the proven older
 
 ```
 group key:  vodcc:grp:{client_ip}:{content_uuid}
-fields:     refcount, reserved, profile_id, account_id, created_at, last_activity
+fields:     refcount, reserved, profile_id, account_id, created_at, last_activity,
+            m:{session_id} (per-session member count, v1.3.0)
 TTL:        GROUP_TTL_SECONDS (60s), refreshed on reserve/release AND
             periodically while streaming (see "Seek coverage" below)
 ```
@@ -74,7 +79,9 @@ sharing one profile-slot reservation and one file.
 
 - **One reserve ↔ one release per group.** The owner's single native reserve is
   balanced by the last-out member's single native release. Riders never INCR and
-  never release. Verified in `test_logic.py` (burst, partial-failure).
+  never release. Membership is counted per *session*, so it does not matter
+  which of a session's requests core joins or releases from (v1.3.0). Verified in
+  `test_logic.py` (burst, partial failure, shared session, create race).
 - **Partial failure:** native calls `_decrement_profile_connections` on every
   rollback path (416, create-failure, mid-stream error) and at teardown; our
   version maps each onto a group leave, so a failed burst member leaves the group
@@ -82,6 +89,77 @@ sharing one profile-slot reservation and one file.
 - **Owner finishing first:** the no-Range probe (#1) often ends before playback
   (#2/#3). Release is tied to *last-out*, not to the owner, so the slot is not
   freed early. Verified.
+
+## Session-level membership (v1.3.0)
+
+Core does its profile accounting **per session**: the request that takes a
+session's `active_streams` from 0 to 1 reserves the slot; later requests on the
+same session are siblings and reserve nothing (`manager:1394`); whichever request
+on the session is **last out** releases it — from the body's teardown, or, since
+v0.32.0, from `_ClosingVODStream`'s closer if the body never started. The
+reserving request and the releasing request can be different.
+
+Through v1.2.0 the plugin tracked group membership **per request** (a
+greenlet-local "plan" set by the reserve and consumed by the release). That only
+lined up with core while every request had its own session — true for every
+client before v0.32.0, because each burst request arrived at the bare URL and was
+minted a new session.
+
+v0.32.0 made the session-mint 301 cacheable (`Cache-Control: private,
+max-age=21600`) so that FFmpeg-based players keep it for the life of one open.
+For those clients a whole burst now arrives on **one** session, and the two
+models diverge:
+
+1. The request that joined the group (the short no-Range open) finishes first.
+   It isn't last out, so core doesn't release, and its plan dies with it.
+2. A sibling request, last out, releases — but it has no plan, so the release
+   went natively, outside the group.
+3. The group is left behind: `refcount 1`, `reserved 1`, with no session behind
+   it.
+4. A stop-and-replay within the group TTL is a new open, so a new session. It
+   joins the leftover group as a rider and takes **no** slot: an uncounted stream
+   on a profile core believes is free. Each such replay refreshes the leftover
+   group, so it can keep itself alive.
+
+This was reproduced in a simulation driving the real v1.2.0 code (stock
+v0.32.0: counter 1 during the replay; v1.2.0: 0, with the leftover group still
+there).
+
+**Fix:** membership is counted per session, as `m:{session_id}` in the group hash
+alongside the total `refcount`. A reserve joins on behalf of its request's
+session; a release leaves on behalf of its request's session — so the join and
+leave pair exactly the way core's reserve and release do, whichever request
+performs each. The session id comes from `stream_vod`'s own argument, which is
+what core hands the connection manager. Release outcomes:
+
+| Leave result | Meaning | Action |
+|---|---|---|
+| last member | group empties | native release |
+| members remain | slot still in use | none |
+| not a member | this session reserved natively (the sub-millisecond race, an unlimited profile, or the plugin off at reserve time) | native release, pairing with that native reserve |
+| group gone | expired | native release (best effort, as before) |
+
+Two related changes ride along:
+
+- **TTL refresh is gated on membership by session.** v1.1.0 refreshed the group
+  while the *request that joined* streamed. On a shared session that request is
+  usually the short one and the long playback is a sibling, so the refresh is now
+  done by any request whose **session** is a member — and only by those, so an
+  unrelated stream for the same `(ip, content)` can't keep a stale group alive.
+- **A request with no session id is never grouped.** It can't be paired safely, so
+  it reserves and releases natively. In practice only core's session-minting 301
+  lacks one, and it reserves nothing.
+
+**Emby is unaffected by the v0.32.0 change.** Its burst comes from the Emby
+server's own HTTP client (no `User-Agent`, so not FFmpeg), which never reuses the
+cached redirect, so each request still gets its own session and v1.2.0 behaved
+correctly there (confirmed live on v0.32.0). v1.3.0 is for clients that *do*
+reuse it. Both shapes are covered in `test_logic.py`, which models core's v0.32.0
+session accounting rather than assuming it.
+
+The Lua scripts are exercised offline only through Python emulators; run
+`tools/lua_selftest.py` inside the container to check them against the real
+Redis after changing them.
 
 ## Seek coverage (v1.1.0)
 
@@ -204,17 +282,26 @@ a migration story, so it is out of scope for a compatibility release.
 
 Dispatcharr runs uWSGI with `gevent = 400` + `gevent-early-monkey-patch`, so
 `threading.local()` is **greenlet-local** — one in-flight request per greenlet.
-Each burst request is a distinct session id ⇒ its own greenlet ⇒ its selection,
-reservation and release all run in the **same** greenlet. Context is set
+Each request's selection, reservation and own releases run in its own greenlet.
+Context — which request this is: `(client_ip, content_uuid, session_id)` — is set
 synchronously at the top of `stream_vod` (covering selection + reservation +
-synchronous rollback releases) and re-asserted inside a wrapper around the
-streaming generator (covering the lazy teardown release).
+synchronous rollback releases) and carried inside a wrapper around the streaming
+body (covering the lazy teardown release). Membership itself lives in Redis, so
+the context only has to identify the session.
 
-The generator wrapper explicitly closes the native generator **before** clearing
-context, so native's teardown release (which runs in native's `GeneratorExit`
-handler on the common *client-stop* path) sees the correct group plan instead of
-firing later at GC with the context already reset. Missing this leaks the
-counter on every client stop — it was caught and fixed with a regression test.
+**Teardown ordering, stated precisely (corrected in v1.3.0).** Django's
+`StreamingHttpResponse` keeps a list of closers and runs them in registration
+order, swallowing exceptions. Core's body registered its closer when core built
+the response; ours registers when we assign `streaming_content` afterwards. So on
+every close — client stop, completion, or (v0.32.0+) a response closed before its
+body started — Django runs core's teardown first, with our context still set, and
+ours second, which then clears the context. Through v1.2.0 this section and the
+code comment claimed the wrapper *explicitly* closed the native generator first.
+It never did: the response's `streaming_content` getter returns a `map` over the
+body, which has no `close`, so that call was a no-op and the ordering was Django's
+all along. The suite now models Django 6.0.8's response faithfully, and the rider
+case of `test_teardown_through_django_response` would fail if the order were
+ever reversed.
 
 The old `cedric-marcoux` plugin stashed context on the singleton manager and
 cleared it in a `finally` that fired before the lazy generator's decrement,
@@ -264,9 +351,8 @@ profile the group never pinned, in three distinct shapes:
 
 - **create race** (`manager:1313-1314`) — the only site where our pick was
   already reserved earlier in the same request (`manager:1233`), so upstream
-  decrements our profile and reserves its own back to back. Our decrement
-  consumes the greenlet-local group plan and the following reserve has to
-  re-establish it.
+  decrements our profile and reserves its own back to back, on the same
+  session: the decrement leaves the group and the reserve rejoins it.
 - **reconnect / idle reuse** (`manager:1341`, `:1361`) — no prior reserve in the
   request; upstream reserves its effective profile directly while the group is
   pinned to another.

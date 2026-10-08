@@ -37,12 +37,13 @@ small Redis "group" and four coordinated monkeypatches:
 
   group key:  vodcc:grp:{client_ip}:{content_uuid}
   fields:     refcount, reserved, profile_id, account_id, created_at,
-              last_activity   (short TTL, refreshed on activity)
+              last_activity, m:{session_id} (per-session member count)
+              (short TTL, refreshed on activity and while members stream)
 
-  1. stream_vod            -- set per-request (client_ip, content_uuid) context
-                              in a greenlet-local, and wrap the streaming
-                              generator so that context survives into the lazy
-                              teardown (profile-release) path.
+  1. stream_vod            -- set per-request (client_ip, content_uuid,
+                              session_id) context in a greenlet-local, and wrap
+                              the streaming body so that context survives into
+                              the lazy teardown (profile-release) path.
   2. _get_m3u_profile      -- if a confirmed group exists for this (ip, content),
                               return the group's already-chosen profile and BYPASS
                               the capacity check (and pin selection to the group's
@@ -60,16 +61,35 @@ Each burst request still opens its OWN upstream provider socket (its own Range)
 via its own RedisBackedVODConnection -> correct concurrent range reads; they
 just share one profile-slot reservation and stay on one provider/file.
 
+Session-level membership (v1.3.0)
+---------------------------------
+Group membership is counted per SESSION (`m:{session_id}` in the group hash),
+not per request. Core reserves a profile slot once per session -- in the request
+that takes the session's active_streams from 0 to 1 -- and releases it once per
+session, in whichever request on that session is LAST out. Those can be two
+different requests. Through v1.2.0 the plugin tracked membership per request (a
+greenlet-local "plan"), which only lined up with core while every request had
+its own session.
+
+Dispatcharr v0.32.0 made the session-mint 301 cacheable, so clients that reuse
+it (FFmpeg-based players) send a whole burst on ONE session. Then the request
+that joined the group could finish first, and a sibling request with no plan of
+its own did the native release outside the group -- leaving an orphan group
+that a quick replay would ride without taking a slot (an uncounted stream).
+Keying membership by session pairs our join/leave exactly the way core pairs
+its reserve/release, whichever request does each.
+
 Why this is safe under Dispatcharr's runtime
 --------------------------------------------
 Dispatcharr runs uWSGI with `gevent = 400` + `gevent-early-monkey-patch`, so
 `threading.local()` is greenlet-local: one in-flight request per greenlet at a
-time, isolated per request. Each burst request is a *separate* session id => a
-separate greenlet => its selection, reservation and release all happen in the
-SAME greenlet. We set the context synchronously at the top of `stream_vod`
-(covering selection + reservation + synchronous rollback releases) and
-re-assert it inside a wrapper around the streaming generator (covering the lazy
-teardown release). We never clear it in a premature `finally`.
+time, isolated per request. Each request's selection, reservation and own
+releases run in its own greenlet. We set the context synchronously at the top of
+`stream_vod` (covering selection + reservation + synchronous rollback releases)
+and re-assert it inside a wrapper around the streaming body (covering the lazy
+teardown release). The context only identifies the request -- (ip, content,
+session) -- while membership itself lives in Redis, so it does not matter which
+of a session's requests ends up doing the release.
 
 Timing: requests are ~250ms apart and each goes through a 301 redirect
 round-trip, so the group owner has confirmed its reservation well before a rider
@@ -179,7 +199,10 @@ _orig_decrement = None
 
 _pid_logged = set()
 
-# Greenlet-local (gevent-patched threading.local) per-request context + plan.
+# Greenlet-local (gevent-patched threading.local) per-request context: which
+# request this is -- (client_ip, content_uuid, session_id). Group MEMBERSHIP is
+# not kept here; it lives in Redis, counted per session (see "Session-level
+# membership" in the module docstring).
 _local = threading.local()
 
 _script_cache = {}
@@ -188,30 +211,44 @@ _script_cache = {}
 # --------------------------------------------------------------------------- #
 # Lua scripts (atomic group accounting)
 # --------------------------------------------------------------------------- #
+#
+# The group hash carries a total `refcount` plus one `m:{session_id}` count per
+# member session. Core reserves once per session (the request that takes it
+# 0 -> 1) and releases once per session (whichever request is last out), so we
+# join and leave per session too. Each script starts with a `-- vodcc:<name>`
+# tag; the offline test harness dispatches on it.
 
-# Join a group: increment refcount, refresh TTL, report refcount + whether the
-# owner has already confirmed a real reservation. Returns {refcount, reserved}.
-_LUA_JOIN = """
+# Join a group as session ARGV[3]: bump the total refcount and that session's
+# member count, refresh the TTL. Returns {refcount, reserved}.
+_LUA_JOIN = """-- vodcc:join
 local k = KEYS[1]
 local ttl = tonumber(ARGV[1])
 local now = ARGV[2]
+local mf = ARGV[3]
 local rc = redis.call('HINCRBY', k, 'refcount', 1)
+redis.call('HINCRBY', k, mf, 1)
 redis.call('HSET', k, 'last_activity', now)
 if rc == 1 then
   redis.call('HSET', k, 'created_at', now)
 end
 redis.call('EXPIRE', k, ttl)
-local reserved = redis.call('HGET', k, 'reserved')
-if reserved == '1' then
+if redis.call('HGET', k, 'reserved') == '1' then
   return {rc, 1}
 end
 return {rc, 0}
 """
 
-# Undo a join (owner's real reservation failed, or a rider backing out to go
-# independent). Deletes the group hash when it empties.
-_LUA_UNDO = """
+# Undo a join by session ARGV[1] (the owner's real reservation failed, or a
+# rider is backing out to reserve independently). Deletes the hash when empty.
+_LUA_UNDO = """-- vodcc:undo
 local k = KEYS[1]
+local mf = ARGV[1]
+if redis.call('EXISTS', k) == 0 then
+  return 0
+end
+if redis.call('HINCRBY', k, mf, -1) <= 0 then
+  redis.call('HDEL', k, mf)
+end
 local rc = redis.call('HINCRBY', k, 'refcount', -1)
 if rc <= 0 then
   redis.call('DEL', k)
@@ -220,7 +257,7 @@ return rc
 """
 
 # Mark a group confirmed and record the chosen profile/account (owner path).
-_LUA_MARK_RESERVED = """
+_LUA_MARK_RESERVED = """-- vodcc:mark
 local k = KEYS[1]
 local ttl = tonumber(ARGV[1])
 if redis.call('EXISTS', k) == 0 then
@@ -231,16 +268,26 @@ redis.call('EXPIRE', k, ttl)
 return 1
 """
 
-# Leave a group: decrement refcount. Returns {code, refcount}:
-#   code =  1  -> this was the last member; caller must do the real release
+# Leave a group on behalf of session ARGV[3]. Returns {code, refcount}:
+#   code =  1  -> that was the last member; caller does the real release
 #   code =  0  -> members remain; caller must NOT release
 #   code = -1  -> group already gone (expired); caller does a best-effort release
-_LUA_LEAVE = """
+#   code = -2  -> this session is not a member (it reserved natively, or never
+#                 joined); caller does the native release that pairs with it
+_LUA_LEAVE = """-- vodcc:leave
 local k = KEYS[1]
 local ttl = tonumber(ARGV[1])
 local now = ARGV[2]
+local mf = ARGV[3]
 if redis.call('EXISTS', k) == 0 then
   return {-1, 0}
+end
+local m = tonumber(redis.call('HGET', k, mf) or '0')
+if m <= 0 then
+  return {-2, tonumber(redis.call('HGET', k, 'refcount') or '0')}
+end
+if redis.call('HINCRBY', k, mf, -1) <= 0 then
+  redis.call('HDEL', k, mf)
 end
 local rc = redis.call('HINCRBY', k, 'refcount', -1)
 redis.call('HSET', k, 'last_activity', now)
@@ -250,6 +297,21 @@ if rc <= 0 then
 end
 redis.call('EXPIRE', k, ttl)
 return {0, rc}
+"""
+
+# Keep a group alive while session ARGV[2] -- a member -- is streaming. Only a
+# member's stream refreshes it, so an unrelated stream for the same (ip,
+# content) cannot keep a stale group alive. EXPIRE on a missing key is never
+# reached (HGET fails first), so this cannot resurrect a dead group.
+_LUA_TOUCH = """-- vodcc:touch
+local k = KEYS[1]
+local ttl = tonumber(ARGV[1])
+local mf = ARGV[2]
+if tonumber(redis.call('HGET', k, mf) or '0') > 0 then
+  redis.call('EXPIRE', k, ttl)
+  return 1
+end
+return 0
 """
 
 
@@ -266,6 +328,7 @@ def _get_scripts(redis_client):
             "undo": redis_client.register_script(_LUA_UNDO),
             "mark": redis_client.register_script(_LUA_MARK_RESERVED),
             "leave": redis_client.register_script(_LUA_LEAVE),
+            "touch": redis_client.register_script(_LUA_TOUCH),
         }
         _script_cache[cache_key] = cached
     return cached
@@ -273,6 +336,10 @@ def _get_scripts(redis_client):
 
 def _group_key(client_ip, content_uuid) -> str:
     return f"{GROUP_PREFIX}{client_ip}:{content_uuid}"
+
+
+def _member_field(session_id) -> str:
+    return f"m:{session_id}"
 
 
 def _get_redis():
@@ -309,31 +376,34 @@ def _as_int(value):
 def _reset_ctx() -> None:
     _local.client_ip = None
     _local.content_uuid = None
-    _local.plan = None
-    _local.group_key = None
+    _local.session_id = None
 
 
-def _set_ctx(client_ip, content_uuid) -> None:
+def _set_ctx(client_ip, content_uuid, session_id=None) -> None:
     _local.client_ip = client_ip
     _local.content_uuid = content_uuid
-    _local.plan = None
-    _local.group_key = None
+    _local.session_id = session_id
+
+
+def _ctx():
+    """(client_ip, content_uuid, session_id) for the current request."""
+    return (
+        getattr(_local, "client_ip", None),
+        getattr(_local, "content_uuid", None),
+        getattr(_local, "session_id", None),
+    )
 
 
 def _snapshot_ctx() -> dict:
-    return {
-        "client_ip": getattr(_local, "client_ip", None),
-        "content_uuid": getattr(_local, "content_uuid", None),
-        "plan": getattr(_local, "plan", None),
-        "group_key": getattr(_local, "group_key", None),
-    }
+    client_ip, content_uuid, session_id = _ctx()
+    return {"client_ip": client_ip, "content_uuid": content_uuid,
+            "session_id": session_id}
 
 
 def _restore_ctx(snap: dict) -> None:
     _local.client_ip = snap.get("client_ip")
     _local.content_uuid = snap.get("content_uuid")
-    _local.plan = snap.get("plan")
-    _local.group_key = snap.get("group_key")
+    _local.session_id = snap.get("session_id")
 
 
 # --------------------------------------------------------------------------- #
@@ -463,6 +533,10 @@ def patched_get_m3u_profile(m3u_account, profile_id, session_id=None, *args, **k
 def patched_reserve(self, m3u_profile, *args, **kwargs):
     """Group-aware replacement for `_check_and_reserve_profile_slot`.
 
+    Joins this request's (ip, content) group on behalf of its SESSION. The first
+    member does the real native reservation; later members ride it. A request
+    with no session id (it cannot be grouped safely) reserves natively.
+
     Core's call sites pass one positional argument today, but "matches today" is
     not durable -- see the note on `patched_get_m3u_profile`. Accepting and
     forwarding anything extra costs nothing and removes this hook as a future
@@ -473,9 +547,9 @@ def patched_reserve(self, m3u_profile, *args, **kwargs):
 
     _log_pid_once("reserve")
 
-    client_ip = getattr(_local, "client_ip", None)
-    content_uuid = getattr(_local, "content_uuid", None)
-    if client_ip is None or content_uuid is None or m3u_profile is None:
+    client_ip, content_uuid, session_id = _ctx()
+    if (client_ip is None or content_uuid is None or session_id is None
+            or m3u_profile is None):
         return _orig_reserve(self, m3u_profile, *args, **kwargs)
     try:
         max_streams = int(getattr(m3u_profile, "max_streams", 0) or 0)
@@ -491,10 +565,11 @@ def patched_reserve(self, m3u_profile, *args, **kwargs):
 
         scripts = _get_scripts(redis_client)
         gkey = _group_key(client_ip, content_uuid)
+        mf = _member_field(session_id)
         now = str(time.time())
         account_id = str(getattr(m3u_profile, "m3u_account_id", "") or "")
 
-        rc, reserved = scripts["join"](keys=[gkey], args=[GROUP_TTL_SECONDS, now])
+        rc, reserved = scripts["join"](keys=[gkey], args=[GROUP_TTL_SECONDS, now, mf])
         rc = int(rc)
         reserved = int(reserved)
 
@@ -505,16 +580,12 @@ def patched_reserve(self, m3u_profile, *args, **kwargs):
                     keys=[gkey],
                     args=[GROUP_TTL_SECONDS, str(m3u_profile.id), account_id],
                 )
-                _local.plan = "GROUP"
-                _local.group_key = gkey
                 logger.info(
                     "[VOD-CC] group OWNER reserved profile %s (account %s) for %s/%s",
                     m3u_profile.id, account_id, client_ip, content_uuid,
                 )
                 return True
-            scripts["undo"](keys=[gkey], args=[])
-            _local.plan = "NONE"
-            _local.group_key = gkey
+            scripts["undo"](keys=[gkey], args=[mf])
             logger.info(
                 "[VOD-CC] group OWNER at capacity for profile %s (%s/%s)",
                 m3u_profile.id, client_ip, content_uuid,
@@ -522,21 +593,19 @@ def patched_reserve(self, m3u_profile, *args, **kwargs):
             return False
 
         if reserved == 1:
-            _local.plan = "GROUP"
-            _local.group_key = gkey
             logger.info(
                 "[VOD-CC] group RIDER shares profile %s slot for %s/%s (members=%s)",
                 m3u_profile.id, client_ip, content_uuid, rc,
             )
             return True
 
-        # rc > 1 but owner not confirmed yet (sub-ms race the real burst doesn't
-        # exhibit): back out and reserve independently -> never ride a phantom slot.
-        scripts["undo"](keys=[gkey], args=[])
-        ok = _orig_reserve(self, m3u_profile, *args, **kwargs)
-        _local.plan = "INDEP" if ok else "NONE"
-        _local.group_key = gkey
-        return ok
+        # rc > 1 but the owner hasn't confirmed yet (a sub-millisecond race the
+        # real burst doesn't exhibit): back out and reserve independently, so we
+        # never ride a phantom slot. This session is then not a member, so its
+        # release finds no membership and goes native -- pairing with this
+        # native reservation.
+        scripts["undo"](keys=[gkey], args=[mf])
+        return _orig_reserve(self, m3u_profile, *args, **kwargs)
 
     except Exception as exc:
         logger.error("[VOD-CC] reserve error, falling back to native: %s", exc)
@@ -553,47 +622,49 @@ def patched_reserve(self, m3u_profile, *args, **kwargs):
 def patched_decrement(self, m3u_profile_id, *args, **kwargs):
     """Group-aware replacement for `_decrement_profile_connections`.
 
+    Leaves the group on behalf of this request's SESSION, whichever of the
+    session's requests core happens to release from. The real native release
+    fires only when the last member leaves; a session that never joined (or a
+    group that has already expired) releases natively. Outside a request
+    context -- core's background stale-connection cleanup -- it is native.
+
     Same signature-agnostic hardening as `patched_reserve`.
     """
     if not _ACTIVE:
         return _orig_decrement(self, m3u_profile_id, *args, **kwargs)
 
-    plan = getattr(_local, "plan", None)
-    gkey = getattr(_local, "group_key", None)
-    if plan is None:
+    client_ip, content_uuid, session_id = _ctx()
+    if client_ip is None or content_uuid is None or session_id is None:
         return _orig_decrement(self, m3u_profile_id, *args, **kwargs)
 
-    # Consume the plan so a stray second decrement can't double-act.
-    _local.plan = None
-    _local.group_key = None
-
     try:
-        if plan == "NONE":
-            return None
-        if plan == "INDEP":
-            return _orig_decrement(self, m3u_profile_id, *args, **kwargs)
-
-        # plan == "GROUP"
         redis_client = getattr(self, "redis_client", None) or _get_redis()
-        if redis_client is None or gkey is None:
+        if redis_client is None:
             return _orig_decrement(self, m3u_profile_id, *args, **kwargs)
 
         scripts = _get_scripts(redis_client)
         code, rc = scripts["leave"](
-            keys=[gkey], args=[GROUP_TTL_SECONDS, str(time.time())]
+            keys=[_group_key(client_ip, content_uuid)],
+            args=[GROUP_TTL_SECONDS, str(time.time()), _member_field(session_id)],
         )
         code = int(code)
-        if code == 1 or code == -1:
+
+        if code == 0:
+            logger.info(
+                "[VOD-CC] group member left profile %s, %s remain (slot held)",
+                m3u_profile_id, rc,
+            )
+            return None
+        if code == 1:
             logger.info(
                 "[VOD-CC] group LAST member -> releasing profile %s", m3u_profile_id
             )
-            return _orig_decrement(self, m3u_profile_id, *args, **kwargs)
-
-        logger.info(
-            "[VOD-CC] group member left profile %s, %s remain (slot held)",
-            m3u_profile_id, rc,
-        )
-        return None
+        elif code == -1:
+            logger.info(
+                "[VOD-CC] group already gone -> releasing profile %s natively",
+                m3u_profile_id,
+            )
+        return _orig_decrement(self, m3u_profile_id, *args, **kwargs)
 
     except Exception as exc:
         logger.error("[VOD-CC] decrement error, falling back to native: %s", exc)
@@ -604,31 +675,120 @@ def patched_decrement(self, m3u_profile_id, *args, **kwargs):
 
 
 # --------------------------------------------------------------------------- #
-# Patched: stream_vod (context carrier + generator wrapper)
+# Patched: stream_vod (context carrier + streaming-body wrapper)
 # --------------------------------------------------------------------------- #
 
-def _extract_request_and_content(args, kwargs):
+class _ContextStream:
+    """Wraps core's streaming body to carry this request's context.
+
+    Two jobs:
+
+    * Keep (ip, content, session) set while the body runs, so core's lazy
+      teardown release -- which runs inside that body -- reaches
+      `patched_decrement` with the right session.
+    * Refresh the group's TTL while bytes flow, but only if this request's
+      session is a member. A single steady playback generates no
+      reserve/release events, so without this the group would expire mid-watch
+      and a later seek would fail over (fixed in v1.1.0). In v0.32.0+ that
+      steady stream can be a sibling request on the member session rather than
+      the one that joined, which is why the check is by session.
+
+    Teardown ordering, stated precisely: Django's `StreamingHttpResponse` keeps a
+    list of closers and runs them in registration order, swallowing exceptions.
+    Core's body registered its closer when core built the response; ours
+    registers when `patched_stream_vod` assigns `streaming_content` afterwards.
+    So on every close Django runs core's teardown first -- with our context
+    still set -- and ours second. We never close core's body ourselves: the
+    response's `streaming_content` getter returns a `map` over it, which has no
+    `close`, so there is no handle to close, and Django already does it. (Before
+    v1.3.0 the comment here claimed an explicit close did this; it never did.)
+
+    `close()` also resets the context when the body never started. Since
+    Dispatcharr v0.32.0 core releases an unstarted response's reservation from
+    its own closer, which runs first, so the release still sees our context.
+    """
+
+    def __init__(self, native, snap, gkey):
+        self._native = iter(native)
+        self._snap = snap
+        self._gkey = gkey
+        self._member_field = (_member_field(snap["session_id"])
+                              if snap.get("session_id") else None)
+        self._redis = None
+        self._started = False
+        self._done = False
+        self._last_refresh = 0.0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._done:
+            raise StopIteration
+        if not self._started:
+            self._started = True
+            _restore_ctx(self._snap)
+            if self._member_field:
+                self._redis = _get_redis()
+            self._last_refresh = time.time()
+        try:
+            chunk = next(self._native)
+        except BaseException:
+            # Exhausted or failed: core's own teardown already ran inside the
+            # body, with our context set. Now it is safe to clear.
+            self._finish()
+            raise
+        self._maybe_refresh()
+        return chunk
+
+    def _maybe_refresh(self):
+        if self._redis is None:
+            return
+        now = time.time()
+        if now - self._last_refresh < GROUP_REFRESH_INTERVAL_SECONDS:
+            return
+        self._last_refresh = now
+        try:
+            _get_scripts(self._redis)["touch"](
+                keys=[self._gkey], args=[GROUP_TTL_SECONDS, self._member_field]
+            )
+        except Exception:
+            pass
+
+    def _finish(self):
+        if not self._done:
+            self._done = True
+            _reset_ctx()
+
+    def close(self):
+        self._finish()
+
+
+def _extract_stream_args(args, kwargs):
     """stream_vod(request, content_type, content_id, session_id=None,
-    profile_id=None, user=None)."""
+    profile_id=None, user=None) -> (request, content_id, session_id)."""
     request = kwargs.get("request")
     if request is None and len(args) >= 1:
         request = args[0]
     content_id = kwargs.get("content_id")
     if content_id is None and len(args) >= 3:
         content_id = args[2]
-    return request, content_id
+    session_id = kwargs.get("session_id")
+    if session_id is None and len(args) >= 4:
+        session_id = args[3]
+    return request, content_id, session_id
 
 
 def patched_stream_vod(*args, **kwargs):
-    """Wrap `stream_vod`: establish (client_ip, content_uuid) context for the
-    whole VOD request (selection + reservation), and re-assert it inside the
-    streaming generator so it survives into the lazy release path."""
+    """Wrap `stream_vod`: establish (client_ip, content_uuid, session_id) context
+    for the whole VOD request (selection + reservation), and carry it into the
+    streaming body so it survives into the lazy release path."""
     if not _ACTIVE:
         return _orig_stream_vod(*args, **kwargs)
 
     _log_pid_once("stream")
 
-    request, content_id = _extract_request_and_content(args, kwargs)
+    request, content_id, session_id = _extract_stream_args(args, kwargs)
     client_ip = None
     content_uuid = None
     try:
@@ -644,7 +804,9 @@ def patched_stream_vod(*args, **kwargs):
         _reset_ctx()
         return _orig_stream_vod(*args, **kwargs)
 
-    _set_ctx(client_ip, content_uuid)
+    # No session id = the first request, which core answers with a 301 that
+    # mints one; nothing is reserved on it, so grouping never needs it.
+    _set_ctx(client_ip, content_uuid, str(session_id) if session_id else None)
 
     try:
         response = _orig_stream_vod(*args, **kwargs)
@@ -655,53 +817,13 @@ def patched_stream_vod(*args, **kwargs):
     streaming_content = getattr(response, "streaming_content", None)
     if streaming_content is None:
         # Non-streaming response (301 redirect, 429/503, error): any synchronous
-        # rollback release already ran (consuming the plan). Clear and return.
+        # rollback release has already run. Clear and return.
         _reset_ctx()
         return response
 
-    snap = _snapshot_ctx()
-    native_gen = streaming_content
-    # Keep this stream's coalescing group alive while it streams. Group keys have
-    # a short TTL that is otherwise only refreshed on reserve/release events; a
-    # single steady playback connection generates none, so after GROUP_TTL the
-    # group would expire mid-watch and a later SEEK (a new request for the same
-    # ip+content, arriving while this connection still holds the provider slot)
-    # would find no group, be treated as a fresh reservation, hit the capacity
-    # wall, and fail over to another provider. Refreshing here prevents that.
-    refresh_gkey = snap.get("group_key") if snap.get("plan") == "GROUP" else None
-
-    def _wrapped_gen():
-        _restore_ctx(snap)
-        refresh_redis = _get_redis() if refresh_gkey else None
-        last_refresh = time.time()
-        try:
-            for chunk in native_gen:
-                yield chunk
-                if refresh_redis is not None:
-                    now = time.time()
-                    if now - last_refresh >= GROUP_REFRESH_INTERVAL_SECONDS:
-                        last_refresh = now
-                        try:
-                            # EXPIRE is a no-op on a missing key, so this only
-                            # extends a live group -- it never resurrects a dead one.
-                            refresh_redis.expire(refresh_gkey, GROUP_TTL_SECONDS)
-                        except Exception:
-                            pass
-        finally:
-            # On client disconnect the server closes THIS generator; native's
-            # profile-release runs inside native_gen's GeneratorExit handler,
-            # which without an explicit close here would only fire later at GC,
-            # after we reset the context -- stripping the greenlet-local plan the
-            # release needs (=> a leaked group refcount on the common client-stop
-            # path). Close native_gen NOW, while context is still set.
-            try:
-                close = getattr(native_gen, "close", None)
-                if close is not None:
-                    close()
-            finally:
-                _reset_ctx()
-
-    response.streaming_content = _wrapped_gen()
+    response.streaming_content = _ContextStream(
+        streaming_content, _snapshot_ctx(), _group_key(client_ip, content_uuid)
+    )
     return response
 
 
