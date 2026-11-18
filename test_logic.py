@@ -777,6 +777,88 @@ def test_create_race_on_one_session():
           ENV.profile_counts[3] == 0 and gkey not in ENV.store)
 
 
+class FakeRedirect:
+    """A non-streaming response (core's 301), with no streaming_content."""
+    status_code = 301
+
+
+def open_sessionless(g, ip, uuid):
+    """A request with no session id that core answers with a 301. On v0.34.1
+    that 301 may point at an EXISTING session (core's session resume); either
+    way core reserves nothing on it."""
+    saved = patch._orig_stream_vod
+    patch._orig_stream_vod = lambda *a, **k: FakeRedirect()
+    try:
+        with g:
+            return patch.patched_stream_vod({"ip": ip}, "movie", uuid, None)
+    finally:
+        patch._orig_stream_vod = saved
+
+
+def test_core_session_resume_v0_34():
+    """Dispatcharr v0.34.1 resumes sessions in every mode: a session-less
+    request is 301'd to an IDLE matching session, or to a running one that
+    closes within 1 s. Resume doesn't claim the session, so two requests can be
+    sent to the same one. The resumed session must rejoin exactly once, two
+    resumers must count as one member, and a full stop + resume must reserve
+    again (no stale membership left behind)."""
+    print("test_core_session_resume_v0_34")
+    ip, uuid = "10.0.0.5", "content-uuid-resume"
+    gkey = patch._group_key(ip, uuid)
+    p = FakeProfile(3, max_streams=1, account_id=7)
+    setup([p]); core = Core(p)
+
+    # Probe session owns; playback session S1 rides, then closes (idle).
+    gp, g1 = Greenlet(), Greenlet()
+    rp = open_request(core, gp, ip, uuid, "PROBE"); pull(gp, rp, 1)
+    r1 = open_request(core, g1, ip, uuid, "S1"); pull(g1, r1); close(g1, r1)
+    check("S1 left the group when it went idle",
+          f"m:S1" not in ENV.store[gkey] and ENV.store[gkey]["refcount"] == 1)
+
+    # Two session-less requests; core redirects both to idle S1.
+    ga, gb = Greenlet(), Greenlet()
+    before = dict(ENV.store[gkey])
+    ra = open_sessionless(ga, ip, uuid)
+    rb = open_sessionless(gb, ip, uuid)
+    check("the redirects pass through untouched and reserve nothing",
+          isinstance(ra, FakeRedirect) and isinstance(rb, FakeRedirect)
+          and ENV.native_reserves == 1 and ENV.store[gkey] == before)
+    check("the redirects leave no context behind",
+          ga.ctx["session_id"] is None and ga.ctx["client_ip"] is None
+          and gb.ctx["client_ip"] is None)
+
+    # Both follow-ups land on S1 concurrently.
+    r2 = open_request(core, ga, ip, uuid, "S1"); pull(ga, r2, 1)
+    r3 = open_request(core, gb, ip, uuid, "S1"); pull(gb, r3, 1)
+    check("resumed S1 rides again: still one native reservation",
+          ENV.native_reserves == 1 and ENV.profile_counts[3] == 1)
+    check("two resumers on S1 count as ONE member",
+          ENV.store[gkey]["m:S1"] == 1 and ENV.store[gkey]["refcount"] == 2)
+
+    pull(ga, r2); close(ga, r2)       # S1's reserving request ends first
+    check("S1 still a member while its other request streams",
+          ENV.store[gkey]["m:S1"] == 1 and ENV.profile_counts[3] == 1)
+    pull(gp, rp); close(gp, rp)       # probe ends
+    check("probe left; slot held for resumed S1",
+          ENV.profile_counts[3] == 1 and ENV.store[gkey]["refcount"] == 1)
+    pull(gb, r3); close(gb, r3)
+    check("last out: counter 0, group gone, one native release",
+          ENV.profile_counts[3] == 0 and gkey not in ENV.store
+          and ENV.native_releases == 1)
+
+    # Sequential resume (a seek after a full stop): S1 idle with no group left.
+    gc = Greenlet()
+    open_sessionless(gc, ip, uuid)
+    r4 = open_request(core, gc, ip, uuid, "S1"); pull(gc, r4, 1)
+    check("resume after a full stop reserves again (counted)",
+          ENV.native_reserves == 2 and ENV.profile_counts[3] == 1
+          and ENV.store[gkey]["m:S1"] == 1)
+    pull(gc, r4); close(gc, r4)
+    check("and releases: counter 0, group gone",
+          ENV.profile_counts[3] == 0 and gkey not in ENV.store
+          and ENV.native_releases == 2)
+
+
 def test_native_reservations_release_natively():
     """Two cases where a session holds a NATIVE slot rather than a membership.
 
@@ -1137,6 +1219,7 @@ if __name__ == "__main__":
     test_shared_session_burst()
     test_probe_session_and_playback_session_with_siblings()
     test_create_race_on_one_session()
+    test_core_session_resume_v0_34()
     test_native_reservations_release_natively()
     test_selection_signature_parity()
     test_profile_allowlist_is_honored()

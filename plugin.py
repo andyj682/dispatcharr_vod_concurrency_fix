@@ -55,7 +55,9 @@ class Plugin:
             "id": "status",
             "label": "Show patch status",
             "description": "Report whether the concurrency patch is active in "
-                           "the worker that handles this request.",
+                           "the process that runs this button. On Dispatcharr "
+                           "0.34+ that is a background worker, not a streaming "
+                           "one; the logs show the streaming workers.",
             "button_label": "Check status",
             "button_variant": "outline",
         },
@@ -75,12 +77,19 @@ class Plugin:
             return {"status": "ok", "message": "VOD concurrency patch reverted"}
         if action == "status":
             import os
+            # On Dispatcharr 0.34+ actions run in a Celery child, which never
+            # serves VOD, so this can only describe the process it runs in.
+            # Streaming workers log their own "[VOD-CC] active in worker
+            # pid=... at stream" line the first time they handle VOD.
+            state = "active" if _patch._ACTIVE else "NOT active"
             return {
                 "status": "ok",
                 "message": (
-                    f"active={_patch._ACTIVE} in worker pid={os.getpid()} "
-                    f"(note: this reflects ONE worker; check logs for all "
-                    f"worker pids)"
+                    f"Patch {state} in the process that ran this check "
+                    f"(pid {os.getpid()}). On Dispatcharr 0.34+ that is a "
+                    f"background worker, not one that streams VOD. To confirm "
+                    f"the streaming workers, look for '[VOD-CC] active in "
+                    f"worker pid=... at stream' in the logs after a play."
                 ),
             }
         return {"status": "error", "message": f"Unknown action: {action}"}

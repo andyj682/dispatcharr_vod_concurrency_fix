@@ -157,6 +157,19 @@ correctly there (confirmed live on v0.32.0). v1.3.0 is for clients that *do*
 reuse it. Both shapes are covered in `test_logic.py`, which models core's v0.32.0
 session accounting rather than assuming it.
 
+**v0.34.x session resume.** A request without a session id now goes through
+`_find_resumable_vod_session` in every mode: an idle session with the same
+fingerprint (content, client IP, User-Agent, user) is resumed at once, or a
+running one is given up to 1 s to close and then resumed; a running session is
+never joined. Resume only *checks* that a session is idle — it doesn't claim it —
+so two session-less requests can both be 301'd to the same session. That makes
+the shared-session shape above reachable for Emby too, not only for clients
+that reuse the cached redirect. Nothing new is needed: the 301 reserves nothing
+and passes through untouched, the resumed session rejoins (or re-owns) the group
+as any session does, and two resumers count as one member.
+`test_core_session_resume_v0_34` covers two resumers on one session while
+another member session still streams, plus a resume after a full stop.
+
 The Lua scripts are exercised offline only through Python emulators; run
 `tools/lua_selftest.py` inside the container to check them against the real
 Redis after changing them.

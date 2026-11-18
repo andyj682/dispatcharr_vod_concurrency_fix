@@ -32,6 +32,14 @@
 > v0.32.0's own redirect change does **not** fix the burst failover for Emby,
 > so the plugin is still needed there. v1.3.0 runs on v0.30.0, v0.31.0 and
 > v0.32.0.
+>
+> **v0.34.x:** every hooked function is unchanged. Core now *resumes* an idle
+> session for a request that arrives without one (and waits up to 1 s for a
+> running one to close), so two requests — Emby's included — can land on the
+> same session. v1.3.0's session-level tracking covers that (see
+> `test_core_session_resume_v0_34`). On v0.34 the **Check status** button
+> runs in a background worker, not a streaming one, so it can't vouch for the
+> streaming workers; use the log lines under *Verify the patch is live*.
 
 Plugin for Dispatcharr that stops overlapping VOD requests from one client —
 the MKV "open-file burst" (2–3 near-simultaneous HTTP range requests) at start,
