@@ -163,8 +163,13 @@ fingerprint (content, client IP, User-Agent, user) is resumed at once, or a
 running one is given up to 1 s to close and then resumed; a running session is
 never joined. Resume only *checks* that a session is idle — it doesn't claim it —
 so two session-less requests can both be 301'd to the same session. That makes
-the shared-session shape above reachable for Emby too, not only for clients
-that reuse the cached redirect. Nothing new is needed: the 301 reserves nothing
+the shared-session shape above reachable for any client that sends a real
+User-Agent, not only for clients that reuse the cached redirect. It does **not**
+reach Emby: the fingerprint needs a real address *and* a real User-Agent
+(`_client_identity` rejects `UNKNOWN_CLIENT`), and Emby's server-side client
+sends none, so core never resumes for it (confirmed live on v0.34.1: every
+request minted a new session, and no resume or wait lines were logged). Nothing
+new is needed: the 301 reserves nothing
 and passes through untouched, the resumed session rejoins (or re-owns) the group
 as any session does, and two resumers count as one member.
 `test_core_session_resume_v0_34` covers two resumers on one session while
